@@ -7,6 +7,12 @@ import {
 
 import { SYSTEM_PROMPT } from './system-prompt.js';
 
+interface ReplyOptions {
+  systemInstruction?: string;
+  contents?: Content[];
+  responseJsonSchema?: Record<string, unknown>;
+}
+
 interface GeminiConfig {
   apiKey: string;
   model: string;
@@ -34,6 +40,7 @@ export function createGeminiService(config: GeminiConfig) {
   async function generateReply(
     text: string,
     signal: AbortSignal,
+    options: ReplyOptions = {},
   ): Promise<{ text: string; content: Content }> {
     if (!text.trim() || text.length > 4096) {
       throw new Error('GEMINI_INPUT');
@@ -48,12 +55,16 @@ export function createGeminiService(config: GeminiConfig) {
     try {
       response = await ai.models.generateContent({
         model: config.model,
-        contents: [
+        contents: options.contents ?? [
           ...history,
           { role: 'user', parts: [{ text }] },
         ],
         config: {
-          systemInstruction: SYSTEM_PROMPT,
+          systemInstruction: options.systemInstruction ?? SYSTEM_PROMPT,
+          ...(options.responseJsonSchema ? {
+            responseMimeType: 'application/json',
+            responseJsonSchema: options.responseJsonSchema,
+          } : {}),
           maxOutputTokens: 4096,
           abortSignal: signal,
         },

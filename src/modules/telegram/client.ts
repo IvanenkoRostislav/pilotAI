@@ -199,6 +199,13 @@ export async function checkTelegramConnection(
 
 export function describeError(error: unknown): string {
   const messages: Record<string, string> = {
+    BOOKING_CONFIG: 'Некоректні BOOKING_RESTAURANT, BOOKING_TIME або BOOKING_GUESTS.',
+    BOOKING_PAST: 'Час бронювання за Europe/London уже настав або минув. Нову дату автоматично не обрано.',
+    BOOKING_UNAVAILABLE: 'Менеджер відмовив у бронюванні на задані параметри.',
+    AGENT_TRANSITION: 'Недозволений перехід стану агента.',
+    AGENT_DECISION: 'Gemini повернув некоректне або недозволене рішення. Автовідповіді зупинено.',
+    AGENT_TURN_LIMIT: 'Досягнуто ліміту 40 рішень. Повний контекст збережено в RAM.',
+    AGENT_STOPPED: 'Програму зупинено.',
     CONFIG_ENV_FILE: 'Не вдалося прочитати файл .env.',
     CONFIG_API_ID: 'Перевір TELEGRAM_API_ID: потрібне додатне ціле число.',
     CONFIG_API_HASH: 'Перевір TELEGRAM_API_HASH: потрібні 32 hex-символи.',
@@ -252,7 +259,7 @@ export function describeError(error: unknown): string {
     'Telegram заборонив надсилання в цей чат.',
 
     PEER_FLOOD:
-    'Telegram обмежив надсилання. Зупини Echo і повтори пізніше.',
+    'Telegram обмежив надсилання. Зупини агента і повтори пізніше.',
 
     MESSAGE_TOO_LONG:
     'Повідомлення перевищує дозволену Telegram довжину.',
@@ -286,7 +293,7 @@ export function describeError(error: unknown): string {
     'Gemini: некоректний запит, ключ або параметри моделі (400).',
 
     GEMINI_UNAVAILABLE:
-    'Gemini: сервіс тимчасово недоступний після обмежених повторних спроб.',
+    'Gemini: сервіс тимчасово недоступний (408 або 5xx).',
 
     GEMINI_API:
     'Gemini: помилка API. Деталі запиту приховано.',
