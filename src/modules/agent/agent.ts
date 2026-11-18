@@ -1,3 +1,4 @@
+import { logger, Logger, errorInfo, type MessageLog, type Explanation } from '../logger/logger.js';
 import type { GeminiService } from '../ai/gemini.js';
 import { loadBooking, slotIsFuture, type Booking } from './config.js';
 import { AGENT_PROMPT } from './prompt.js';
@@ -5,7 +6,8 @@ import { AGENT_PROMPT } from './prompt.js';
 export type State = 'IDLE' | 'NEGOTIATING' | 'NEEDS_INPUT' |
   'CONFIRMING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 type Field = 'restaurant' | 'name' | 'phone' | 'email' | 'other';
-export interface Receipt { runId: number; revision: number; mayConfirm: boolean; text: string }
+export interface Arrival { runId: number; revision: number; mayConfirm: boolean }
+export interface Receipt extends Arrival { text: string; audit: MessageLog }
 type Entry = { source: 'owner' | 'manager' | 'assistant' | 'system'; text: string };
 type Decision = {
   action: 'SEND' | 'NEEDS_INPUT' | 'CONFIRMED' | 'UNAVAILABLE';
@@ -43,15 +45,20 @@ export class BookingAgent {
   private lastError = '';
   private version = 0;
   private revision = 0;
+  private bookingSessionId: string | null = null;
+  private readonly pendingMessages = new Map<number, MessageLog>();
 
   constructor(
     private readonly gemini: GeminiService,
-    private readonly send: (text: string) => Promise<void>,
+    private readonly send: (text: string, isCurrent?: () => boolean) => Promise<void>,
     private readonly describeError: (error: unknown) => string,
-    private readonly log: (text: string) => void = console.log,
+    private readonly log: (text: string) => void = logger.notice,
     private readonly now: () => Date = () => new Date(),
+    private readonly audit: Logger = logger,
   ) {}
 
+  get sessionId(): string | null { return this.bookingSessionId; }
+  get currentState(): State { return this.state; }
   get running(): boolean { return active.has(this.state); }
   get runId(): number { return this.version; }
   get canConfirm(): boolean {
@@ -73,7 +80,9 @@ export class BookingAgent {
   private move(next: State): void {
     if (this.state === next) return;
     if (!transitions[this.state].includes(next)) throw new Error('AGENT_TRANSITION');
+    const previous = this.state;
     this.state = next;
+    this.audit.technical('info', 'agent.state_changed', { from: previous, to: next }, this.sessionId);
     this.journal.push({ source: 'system', text: 'State: ' + next });
     this.log('[AGENT] ' + next);
   }
@@ -83,6 +92,11 @@ export class BookingAgent {
     this.lastError = this.describeError(error);
     this.confirmationReady = false;
     this.move('FAILED');
+    this.audit.technical('error', 'agent.failed', errorInfo(error), this.sessionId);
+    this.finishPending('booking_failed');
+    this.audit.technical('error', 'booking.finished', {
+      outcome: 'FAILED', managerConfirmed: this.managerConfirmed,
+    }, this.sessionId);
     this.log(this.lastError);
     this.log('Автовідповіді вимкнено. Перед повторним запуском перевір чат вручну.');
   }
@@ -97,7 +111,10 @@ export class BookingAgent {
     this.resume = this.state === 'CONFIRMING' ? 'CONFIRMING' : 'NEGOTIATING';
     this.waiting = field;
     this.move('NEEDS_INPUT');
-    this.log(question);
+    // Model questions can echo personal data; only a safe field description is logged.
+    this.log(field === 'other' ? 'Потрібне уточнення. Перевір останнє повідомлення менеджера в Telegram.' :
+      'Потрібне поле: ' + field);
+    this.audit.technical('info', 'agent.input_required', { field }, this.sessionId);
     this.log('Введи /input ' + field + ' значення або /stop.');
     if (field === 'other') {
       this.log('Дата, час і кількість гостей заблоковані. Для зміни: /stop, нова конфігурація і перезапуск.');
@@ -110,9 +127,12 @@ export class BookingAgent {
       return;
     }
     this.version += 1;
+    this.bookingSessionId = this.audit.newBookingId();
+    this.audit.technical('info', 'booking.started', {}, this.sessionId);
     this.abort = new AbortController();
     try {
       this.booking = loadBooking(this.now());
+      this.audit.rememberPrivate(this.booking.restaurant);
       this.ensureFuture();
       this.move('NEGOTIATING');
       this.journal.push({ source: 'owner', text: '/book: ' + JSON.stringify(this.booking) });
@@ -133,6 +153,8 @@ export class BookingAgent {
     this.version += 1;
     this.confirmationReady = false;
     this.move('CANCELLED');
+    this.finishPending('cancelled');
+    this.audit.technical('info', 'booking.finished', { outcome: 'CANCELLED' }, this.sessionId);
     this.log('Зупинено локально. Уже надіслані повідомлення та бронювання в ресторані не скасовано.');
   }
 
@@ -149,6 +171,8 @@ export class BookingAgent {
       this.log('Некоректне значення. Повтори /input або /stop.');
       return;
     }
+    this.audit.rememberPrivate(value);
+    this.audit.technical('info', 'agent.input_received', { field }, this.sessionId);
     this.journal.push({ source: 'owner', text: field + ': ' + value });
     if (field === 'restaurant') this.booking = { ...this.booking!, restaurant: value };
     if (field === 'name' || field === 'phone' || field === 'email') this.personal[field] = value;
@@ -164,9 +188,11 @@ export class BookingAgent {
         await this.sendChecked(
           'The ' + field + ' for the booking is ' + value + '. Thank you.',
           version,
+          { understood: 'Менеджер запросив поле ' + field + '; користувач надав значення.',
+            decision: 'provide_' + field },
         );
       } catch (error) {
-        if (version === this.version && this.running) this.fail(error);
+        if (version === this.version && this.running && !(error instanceof Error && error.message === 'AGENT_SUPERSEDED')) this.fail(error);
       }
       return;
     }
@@ -175,22 +201,58 @@ export class BookingAgent {
     await this.step();
   }
 
-  observe(text: string): Receipt | undefined {
+  reserveIncoming(): Arrival | undefined {
     if (!this.running) return undefined;
-    this.journal.push({ source: 'manager', text });
     this.revision += 1;
-    return { runId: this.version, revision: this.revision,
-      mayConfirm: this.canConfirm, text };
+    return { runId: this.version, revision: this.revision, mayConfirm: this.canConfirm };
+  }
+
+  observe(text: string, arrival = this.reserveIncoming()): Receipt | undefined {
+    if (!arrival || !this.running || arrival.runId !== this.version) return undefined;
+    this.journal.push({ source: 'manager', text });
+    const audit = this.audit.message({
+      bookingSessionId: this.sessionId, direction: 'IN', text,
+    });
+    this.pendingMessages.set(arrival.revision, audit);
+    return { ...arrival, text, audit };
   }
 
   async receive(receipt: Receipt): Promise<void> {
-    if (!this.running || receipt.runId !== this.version ||
-        receipt.revision !== this.revision) return;
-    if (this.state === 'NEEDS_INPUT') {
-      this.log('[AGENT] Повідомлення збережено; очікується введення в консолі.');
-      return;
+    try {
+      if (!this.running || receipt.runId !== this.version) {
+        receipt.audit.finish({ understood: 'Бронювання більше не активне.',
+          decision: 'ignored', state: this.state });
+        return;
+      }
+      if (receipt.revision !== this.revision) {
+        receipt.audit.finish({ understood: 'Надійшло новіше повідомлення; текст збережено в RAM.',
+          decision: 'superseded', state: this.state });
+        return;
+      }
+      if (this.state === 'NEEDS_INPUT' && this.waiting === 'other') {
+        // A later manager message may resolve an incomplete/ambiguous reply.
+        // Re-evaluate it with the full transcript; never treat it as owner consent.
+        this.audit.technical('info', 'agent.input_reassessed', { field: 'other' }, this.sessionId);
+        this.waiting = undefined;
+        this.move(this.resume);
+      }
+      if (this.state === 'NEEDS_INPUT') {
+        receipt.audit.finish({ understood: 'Повідомлення збережено; потрібне введення користувача.',
+          decision: 'wait_for_owner', state: this.state });
+        this.log('[AGENT] Повідомлення збережено; очікується введення в консолі.');
+        return;
+      }
+      await this.step(receipt.text, receipt.mayConfirm, receipt.audit);
+    } finally {
+      this.pendingMessages.delete(receipt.revision);
     }
-    await this.step(receipt.text, receipt.mayConfirm);
+  }
+
+  private finishPending(decision: string): void {
+    for (const audit of this.pendingMessages.values()) {
+      audit.finish({ understood: 'Активну обробку припинено.', decision, state: this.state });
+    }
+    this.pendingMessages.clear();
   }
 
   private menu(): Record<string, string> {
@@ -221,7 +283,8 @@ export class BookingAgent {
     return menu;
   }
 
-  private async step(managerText = '', mayConfirm = false): Promise<void> {
+  private async step(managerText = '', mayConfirm = false, incoming?: MessageLog): Promise<void> {
+    let explanation = { understood: 'Повідомлення не вдалося обробити.', decision: 'processing_failed' };
     const version = this.version;
     const revision = this.revision;
     try {
@@ -240,7 +303,7 @@ export class BookingAgent {
         },
         required: ['action', 'messageKey', 'message', 'field', 'question'],
       };
-      const result = await this.gemini.generateReply(
+      const generate = (feedback = '') => this.gemini.generateReply(
         'Choose the next booking action.', this.abort.signal, {
           systemInstruction: AGENT_PROMPT,
           contents: [{
@@ -249,24 +312,47 @@ export class BookingAgent {
               state: this.state, transcript: this.journal,
               firstContact: keys.includes('opening'),
               mayConfirm: mayConfirm && this.canConfirm, menu,
+              decisionFeedback: feedback,
             }) }],
           }],
           responseJsonSchema: schema,
+          bookingSessionId: this.sessionId,
         },
       );
-      if (!this.running || version !== this.version || revision !== this.revision) return;
-      this.ensureFuture();
-      let d: Decision;
-      try { d = JSON.parse(result.text) as Decision; }
-      catch { throw new Error('AGENT_DECISION'); }
-      if (!d || !['SEND', 'NEEDS_INPUT', 'CONFIRMED', 'UNAVAILABLE'].includes(d.action) ||
-          ![...keys, 'none'].includes(d.messageKey) ||
-          !['name', 'phone', 'email', 'other', 'none'].includes(d.field) ||
-          typeof d.message !== 'string' ||
-          (d.action === 'SEND' ? d.message !== menu[d.messageKey] : d.message !== '') ||
-          typeof d.question !== 'string' || d.question.length > 500) {
-        throw new Error('AGENT_DECISION');
+      const parseDecision = (text: string): Decision => {
+        let decision: Decision;
+        try { decision = JSON.parse(text) as Decision; }
+        catch { throw new Error('AGENT_DECISION'); }
+        if (!decision || !['SEND', 'NEEDS_INPUT', 'CONFIRMED', 'UNAVAILABLE'].includes(decision.action) ||
+            ![...keys, 'none'].includes(decision.messageKey) ||
+            !['name', 'phone', 'email', 'other', 'none'].includes(decision.field) ||
+            typeof decision.message !== 'string' ||
+            (decision.action === 'SEND' ? decision.message !== menu[decision.messageKey] : decision.message !== '') ||
+            typeof decision.question !== 'string' || decision.question.length > 500) {
+          throw new Error('AGENT_DECISION');
+        }
+        return decision;
+      };
+      let d = parseDecision((await generate()).text);
+      if (d.action === 'NEEDS_INPUT' && d.field === 'none' && !keys.includes('opening') &&
+          this.running && version === this.version && revision === this.revision) {
+        this.audit.technical('warn', 'agent.decision_repair', { reason: 'missing_input_field' }, this.sessionId);
+        d = parseDecision((await generate(
+          'Your previous decision was NEEDS_INPUT with field none. That combination is invalid. ' +
+          'Read the latest manager message in the transcript and choose name, phone, email, or other. ' +
+          'A manager introducing themselves does not supply the guest name. ' +
+          'Return the next decision using the same booking parameters and message menu.',
+        )).text);
+        // A repeated missing field requires owner review, never fabricated data
+        // or a fatal shutdown of an otherwise valid booking conversation.
+        if (d.action === 'NEEDS_INPUT' && d.field === 'none') d = { ...d, field: 'other' };
       }
+      if (!this.running || version !== this.version || revision !== this.revision) {
+        explanation = { understood: 'Рішення застаріло або роботу зупинено.', decision: 'superseded' };
+        return;
+      }
+      this.ensureFuture();
+      explanation = this.explain(d);
       this.journal.push({ source: 'system', text: 'Decision: ' + JSON.stringify(d) });
       if (keys.includes('opening') && d.action !== 'SEND') throw new Error('AGENT_DECISION');
       if (d.action === 'NEEDS_INPUT') {
@@ -277,6 +363,8 @@ export class BookingAgent {
       if (d.action === 'UNAVAILABLE') throw new Error('BOOKING_UNAVAILABLE');
       if (d.action === 'CONFIRMED') {
         if (!mayConfirm || !this.canConfirm || !explicitYes(managerText)) {
+          explanation = { understood: 'Підтвердження не пройшло перевірку всіх параметрів.',
+            decision: 'request_owner_verification' };
           this.need('other', 'Немає однозначного підтвердження всіх параметрів. Перевір чат.');
           return;
         }
@@ -284,9 +372,12 @@ export class BookingAgent {
         const b = this.booking!;
         await this.sendChecked('Thank you for confirming. Booking confirmed: ' +
           b.restaurant + ', London, ' + b.date + ', ' + b.time +
-          ' (Europe/London), ' + b.guests + ' guests.', version);
+          ' (Europe/London), ' + b.guests + ' guests.', version, explanation);
         if (version !== this.version || !this.running) return;
         this.move('COMPLETED');
+        incoming?.finish({ ...explanation, state: this.state });
+        this.finishPending('booking_completed');
+        this.audit.technical('info', 'booking.finished', { outcome: 'COMPLETED' }, this.sessionId);
         this.log('Бронювання підтверджено. Автоматичні відповіді припинено.');
         return;
       }
@@ -294,19 +385,65 @@ export class BookingAgent {
       if (!message) throw new Error('AGENT_DECISION');
       this.confirmationReady = false;
       this.move(d.messageKey === 'confirm' ? 'CONFIRMING' : 'NEGOTIATING');
-      await this.sendChecked(d.message, version);
+      await this.sendChecked(d.message, version, explanation);
       if (version === this.version && this.running) {
         this.confirmationReady = d.messageKey === 'confirm';
       }
     } catch (error) {
-      if (version === this.version && this.running) this.fail(error);
+      if (error instanceof Error && error.message === 'AGENT_SUPERSEDED') {
+        explanation = { understood: 'New input arrived during speech generation.', decision: 'superseded' };
+        return;
+      }
+      if (version === this.version && this.running) {
+        incoming?.finish({
+          understood: explanation.understood,
+          decision: String(errorInfo(error).errorCode),
+          state: 'FAILED',
+        });
+        this.fail(error);
+      }
+    } finally {
+      incoming?.finish({ ...explanation, state: this.state });
     }
   }
 
-  private async sendChecked(text: string, version: number): Promise<void> {
+  private explain(d: Decision): Omit<Explanation, 'state'> {
+    if (d.action === 'NEEDS_INPUT') return {
+      understood: 'Потрібні відсутні дані або уточнення; поле: ' + d.field,
+      decision: 'request_owner_input',
+    };
+    if (d.action === 'UNAVAILABLE') return {
+      understood: 'Менеджер відмовив у бронюванні на задані параметри.',
+      decision: 'booking_unavailable',
+    };
+    if (d.action === 'CONFIRMED') return {
+      understood: 'Менеджер явно підтвердив попереднє повне зведення.',
+      decision: 'complete_booking',
+    };
+    return {
+      understood: d.messageKey === 'confirm' ? 'Потрібне явне підтвердження всіх параметрів.' :
+        d.messageKey.startsWith('details_') ? 'Запитано раніше надані персональні дані.' :
+        d.messageKey.startsWith('opening') ? 'Користувач запустив запит бронювання.' :
+        'Потрібно уточнити доступність початкових параметрів.',
+      decision: d.messageKey,
+    };
+  }
+
+  private async sendChecked(
+    text: string, version: number, explanation: Omit<Explanation, 'state'>,
+  ): Promise<void> {
     if (version !== this.version || !this.running) return;
     this.ensureFuture();
-    await this.send(text);
+    const revision = this.revision;
+    try { await this.send(text, () => version === this.version && revision === this.revision && this.running); }
+    catch (error) {
+      if (error instanceof Error && error.message === 'AGENT_SUPERSEDED') throw error;
+      this.audit.technical('error', 'telegram.send_failed', errorInfo(error), this.sessionId);
+      throw error;
+    }
+    this.audit.message({
+      bookingSessionId: this.sessionId, direction: 'OUT', text, trustedText: true,
+    }).finish({ ...explanation, state: this.state });
     // Log completed delivery even if /stop arrived while Telegram was sending.
     this.journal.push({ source: 'assistant', text });
   }

@@ -3,13 +3,18 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import * as sdk from '@google/genai';
+import { Logger } from '../../../dist/modules/logger/logger.js';
+
+const loggerModule = new URL('../../../dist/modules/logger/logger.js', import.meta.url).href;
 
 test('Gemini agent options isolate booking context and preserve ordinary chat', async () => {
   const requests = [];
+  let failureStatus = 0;
   class FakeGoogleGenAI {
     constructor() {
       this.models = { generateContent: async (request) => {
         requests.push(request);
+        if (failureStatus) throw new sdk.ApiError({ status: failureStatus, message: 'PRIVATE_API_REQUEST_BODY' });
         return { candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: [{ text: 'Reply' }] } }], text: 'Reply' };
       } };
     }
@@ -19,8 +24,11 @@ test('Gemini agent options isolate booking context and preserve ordinary chat', 
   source = source.replace(/import .* from '@google\/genai';/,
     'const {ApiError,FinishReason,GoogleGenAI}=globalThis.pilotGeminiTest;');
   source = source.replace(/import .* from '.\/system-prompt.js';/, 'const SYSTEM_PROMPT="Ordinary chat";');
+  source = source.replace("'../logger/logger.js'", JSON.stringify(loggerModule));
   const { createGeminiService } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
-  const service = createGeminiService({ apiKey: 'fake', model: 'gemini-3.1-flash-lite' });
+  const events = [];
+  const audit = new Logger({ files: false, color: false, output: (line) => events.push(JSON.parse(line)) });
+  const service = createGeminiService({ apiKey: 'fake', model: 'gemini-3.1-flash-lite', audit });
   const signal = new AbortController().signal;
   const reply = await service.generateReply('My name is Alex', signal);
   service.rememberExchange('My name is Alex', reply.content);
@@ -35,6 +43,14 @@ test('Gemini agent options isolate booking context and preserve ordinary chat', 
   assert.equal(requests.at(-1).contents.length, 3);
   assert.equal(requests.at(-1).config.systemInstruction, 'Ordinary chat');
   assert.equal(requests.at(-1).config.responseMimeType, undefined);
+  const bookingSessionId = audit.newBookingId();
+  failureStatus = 503;
+  await assert.rejects(service.generateReply('test', signal, { bookingSessionId }), { message: 'GEMINI_UNAVAILABLE' });
+  failureStatus = 429;
+  await assert.rejects(service.generateReply('test', signal, { bookingSessionId }), { message: 'GEMINI_RATE_LIMIT' });
+  assert.deepEqual(events.filter((row) => row.event === 'gemini.api_error').map((row) => row.data.status), [503, 429]);
+  assert.equal(events.every((row) => row.bookingSessionId === bookingSessionId), true);
+  assert.equal(JSON.stringify(events).includes('PRIVATE_API_REQUEST_BODY'), false);
   delete globalThis.pilotGeminiTest;
 });
 
@@ -51,6 +67,7 @@ test('Telegram command wiring: startup silence, filters, chat, book and immediat
     cancel() { this.running = false; }
     status() {}
     observe(text) { return this.running ? { text } : undefined; }
+    reserveIncoming() { return undefined; }
     async receive() { received++; }
     async input() {}
   }
@@ -60,6 +77,8 @@ test('Telegram command wiring: startup silence, filters, chat, book and immediat
   source = source.replace("import { Api } from 'teleproto';", 'const {Api}=globalThis.pilotMessagingTest;');
   source = source.replace(/import \{ NewMessage,? \} from 'teleproto\/events';/, 'const {NewMessage}=globalThis.pilotMessagingTest;');
   source = source.replace("import { BookingAgent } from '../agent/agent.js';", 'const {BookingAgent}=globalThis.pilotMessagingTest;');
+  source = source.replace("'../logger/logger.js'", JSON.stringify(loggerModule));
+  source = source.replace("'./voice.js'", JSON.stringify(new URL('../../../dist/modules/telegram/voice.js', import.meta.url).href));
   const { runMessaging } = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
   let handler;
   const client = {
@@ -71,7 +90,8 @@ test('Telegram command wiring: startup silence, filters, chat, book and immediat
     generateReply: async () => { calls++; return { text: 'Model reply', content: {} }; },
     rememberExchange() {}, reset() {},
   };
-  const running = runMessaging(client, 'test_user', (error) => error.message, gemini);
+  const running = runMessaging(client, 'test_user', (error) => error.message, gemini,
+    new Logger({ files: false, console: false }));
   const flush = async () => { for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve)); };
   const event = (message = {}) => ({ isPrivate: true, chatId: 42,
     message: { out: false, senderId: 42, message: 'Hello', id: 1, ...message } });

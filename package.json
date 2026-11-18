@@ -10,7 +10,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "pretest": "npm run build",
-    "test": "node --test src/modules/agent/agent.test.mjs src/modules/agent/integration.test.mjs"
+    "test": "node --test src/modules/agent/agent.test.mjs src/modules/agent/integration.test.mjs src/modules/logger/logger.test.mjs src/modules/ai/voice.test.mjs src/modules/audio/opus.test.mjs src/modules/telegram/voice.test.mjs",
+    "check:voice": "node scripts/check-voice.mjs"
   },
   "type": "module",
   "engines": {

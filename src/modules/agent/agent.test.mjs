@@ -2,6 +2,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { BookingAgent } from '../../../dist/modules/agent/agent.js';
 import { londonClock, loadBooking } from '../../../dist/modules/agent/config.js';
+import { Logger } from '../../../dist/modules/logger/logger.js';
 
 let saved;
 beforeEach(() => {
@@ -42,7 +43,8 @@ function setup(decisions, options = {}) {
   const agent = new BookingAgent(gemini, async (text) => {
     if (options.failSend?.(text)) throw new Error('DELIVERY_UNCERTAIN');
     outgoing.push(text);
-  }, (error) => error.message, (text) => logs.push(text), now);
+  }, (error) => error.message, (text) => logs.push(text), now,
+    options.audit ?? new Logger({ files: false, console: false }));
   const status = () => { agent.status(); return JSON.parse(logs.at(-1)); };
   const receive = async (text) => {
     const receipt = agent.observe(text);
@@ -50,6 +52,51 @@ function setup(decisions, options = {}) {
   };
   return { agent, outgoing, calls, status, receive };
 }
+
+test('complete follow-up replaces general clarification with a specific owner name request', async () => {
+  const s = setup([send('opening'), need('other'), need('name')]);
+  await s.agent.start();
+  await s.receive('Good afternoon. Yes, we have');
+  assert.equal(s.status().needsInput, 'other');
+  await s.receive('We have a table for two at 17:00. What name should it be under?');
+  assert.equal(s.status().state, 'NEEDS_INPUT');
+  assert.equal(s.status().needsInput, 'name');
+  assert.equal(s.calls.length, 3);
+  assert.ok(s.calls.at(-1).transcript.some(e => e.text === 'Good afternoon. Yes, we have'));
+  await s.agent.input('name', 'Guest Owner');
+  assert.equal(s.outgoing.at(-1), 'The name for the booking is Guest Owner. Thank you.');
+});
+
+test('manager follow-up can resolve ambiguity without owner input or changing booking parameters', async () => {
+  const s = setup([send('opening'), need('other'), send('confirm'), confirmed]);
+  await s.agent.start();
+  await s.receive('We might have a table.');
+  await s.receive('We have checked: two guests at 17:00 today at Test Bistro is available.');
+  assert.equal(s.status().state, 'CONFIRMING');
+  assert.equal(s.status().needsInput, undefined);
+  assert.equal(s.status().booking.time, '17:00');
+  await s.receive('Confirmed');
+  assert.equal(s.status().state, 'COMPLETED');
+});
+
+test('manager cannot supply missing restaurant or bypass owner consent while paused', async () => {
+  process.env.BOOKING_RESTAURANT = '';
+  const missing = setup([]);
+  await missing.agent.start();
+  await missing.receive('Use My Bistro');
+  assert.equal(missing.status().needsInput, 'restaurant');
+  assert.equal(missing.calls.length, 0);
+  process.env.BOOKING_RESTAURANT = 'Test Bistro';
+  const s = setup([send('opening'), send('confirm'), need('other'), confirmed]);
+  await s.agent.start();
+  await s.receive('Available');
+  await s.receive('A deposit is required.');
+  await s.receive('Confirmed');
+  assert.equal(s.status().state, 'NEEDS_INPUT');
+  assert.equal(s.status().needsInput, 'other');
+  assert.equal(s.status().managerConfirmed, false);
+  assert.equal(s.outgoing.length, 2);
+});
 
 test('IDLE does not invoke Gemini or send', () => {
   const s = setup([]);
@@ -111,6 +158,45 @@ test('requested phone and email are delivered before any further model decision'
     assert.equal(s.calls.length, 2);
     assert.equal(s.agent.canConfirm, false);
   }
+});
+
+test('missing NEEDS_INPUT field is repaired once and owner supplies guest name, not manager name', async () => {
+  const s = setup([send('opening'), need('none'), need('name')]);
+  await s.agent.start();
+  await s.receive('Hello, what is your name? I am Alex.');
+  assert.equal(s.status().state, 'NEEDS_INPUT');
+  assert.equal(s.status().needsInput, 'name');
+  assert.equal(s.calls.length, 3);
+  assert.match(s.calls.at(-1).decisionFeedback, /field none/);
+  assert.deepEqual(s.status().knownPersonalFields, []);
+  assert.equal(s.outgoing.length, 1);
+  await s.agent.input('name', 'Guest Owner');
+  assert.equal(s.outgoing.at(-1), 'The name for the booking is Guest Owner. Thank you.');
+  assert.equal(s.status().state, 'NEGOTIATING');
+});
+
+test('repeated missing input field pauses for owner review without looping or failing', async () => {
+  const s = setup([send('opening'), need('none'), need('none')]);
+  await s.agent.start();
+  await s.receive('We need some details.');
+  assert.equal(s.status().state, 'NEEDS_INPUT');
+  assert.equal(s.status().needsInput, 'other');
+  assert.equal(s.calls.length, 3);
+  assert.equal(s.outgoing.length, 1);
+  assert.equal(s.status().managerConfirmed, false);
+});
+
+test('stop during missing-field repair prevents late replies and preserves cancellation', async () => {
+  let finish;
+  const s = setup([send('opening'), need('none'), () => new Promise(resolve => { finish = resolve; })]);
+  await s.agent.start();
+  const working = s.receive('Your name?');
+  while (!finish) await new Promise(resolve => setImmediate(resolve));
+  s.agent.cancel();
+  finish(need('name'));
+  await working;
+  assert.equal(s.status().state, 'CANCELLED');
+  assert.equal(s.outgoing.length, 1);
 });
 
 test('personal detail delivery failure stops the booking', async () => {
@@ -242,4 +328,65 @@ test('failed final recap preserves manager confirmation without claiming deliver
   assert.equal(s.status().managerConfirmed, true);
   await s.agent.start();
   assert.equal(s.calls.length, 3);
+});
+
+test('booking audit records one row per message with a single UUID and redacted personal data', async () => {
+  const rows = [];
+  const audit = new Logger({ files: false, color: false, output: (line) => rows.push(JSON.parse(line)) });
+  const s = setup([send('opening'), need('name'), send('confirm'), confirmed], { audit });
+  await s.agent.start();
+  await s.receive('What name should it be under?');
+  await s.agent.input('name', 'Alex Private');
+  await s.receive('Please confirm all details');
+  await s.receive('Confirmed');
+  const messages = rows.filter((row) => row.event === 'conversation.message');
+  assert.equal(messages.length, 7);
+  assert.equal(messages.filter((row) => row.direction === 'IN').length, 3);
+  assert.equal(messages.filter((row) => row.direction === 'OUT').length, 4);
+  assert.equal(new Set(messages.map((row) => row.bookingSessionId)).size, 1);
+  assert.match(messages[0].bookingSessionId, /^[0-9a-f-]{36}$/);
+  assert.equal(messages.find((row) => row.decision === 'request_owner_input').state, 'NEEDS_INPUT');
+  assert.equal(messages.filter((row) => row.direction === 'IN').at(-1).state, 'COMPLETED');
+  assert.equal(rows.filter((row) => row.event === 'booking.started').length, 1);
+  assert.equal(rows.filter((row) => row.event === 'booking.finished').length, 1);
+  assert.equal(rows.find((row) => row.event === 'booking.finished').data.outcome, 'COMPLETED');
+  assert.equal(JSON.stringify(rows).includes('Alex Private'), false);
+  assert.equal(JSON.stringify(rows).includes('Test Bistro'), false);
+});
+
+test('pending inbound audit is finalized once when /stop interrupts a model request', async () => {
+  const rows = [];
+  let finish;
+  const audit = new Logger({ files: false, color: false, output: (line) => rows.push(JSON.parse(line)) });
+  const s = setup([send('opening'), () => new Promise((resolve) => { finish = resolve; })], { audit });
+  await s.agent.start();
+  const processing = s.agent.receive(s.agent.observe('Private manager text'));
+  s.agent.cancel();
+  finish(send('confirm'));
+  await processing;
+  audit.flush({ understood: 'Shutdown', decision: 'shutdown', state: 'CANCELLED' });
+  const inbound = rows.filter((row) => row.event === 'conversation.message' && row.direction === 'IN');
+  assert.equal(inbound.length, 1);
+  assert.equal(inbound[0].decision, 'cancelled');
+  assert.equal(inbound[0].state, 'CANCELLED');
+  assert.equal(JSON.stringify(rows).includes('Private manager text'), false);
+  assert.equal(rows.filter((row) => row.event === 'conversation.message' && row.direction === 'OUT').length, 1);
+});
+
+test('superseded incoming messages each retain exactly one audit row', async () => {
+  const rows = [];
+  let finish;
+  const audit = new Logger({ files: false, color: false, output: (line) => rows.push(JSON.parse(line)) });
+  const s = setup([send('opening'), () => new Promise((resolve) => { finish = resolve; }), send('confirm')], { audit });
+  await s.agent.start();
+  const working = s.agent.receive(s.agent.observe('Available'));
+  const latest = s.agent.observe('Please confirm');
+  finish(send('repeat'));
+  await working;
+  await s.agent.receive(latest);
+  const inbound = rows.filter((row) => row.event === 'conversation.message' && row.direction === 'IN');
+  assert.equal(inbound.length, 2);
+  assert.equal(inbound[0].decision, 'superseded');
+  assert.equal(inbound[1].decision, 'confirm');
+  assert.equal(s.outgoing.length, 2);
 });

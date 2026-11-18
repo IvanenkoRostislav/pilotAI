@@ -1,3 +1,4 @@
+import { logger as appLogger } from '../logger/logger.js';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
@@ -9,6 +10,8 @@ import { StringSession } from 'teleproto/sessions';
 import { runMessaging } from './messanging.js';
 
 import { createGeminiService } from '../ai/gemini.js';
+import { createVoiceService } from '../ai/voice.js';
+import { createOpusConverter } from '../audio/opus.js';
 
 const sessionDirectory = resolve('.sessions');
 const sessionFile = resolve(sessionDirectory, 'telegram.session');
@@ -19,6 +22,10 @@ interface TelegramConfig {
     targetUsername: string;
     geminiApiKey: string;
     geminiModel: string;
+    transcriptionModel?: string;
+    ttsModel?: string;
+    ttsVoice?: string;
+    ffmpegPath?: string;
 }
 
 async function loadSession(): Promise<string> {
@@ -124,7 +131,7 @@ export async function checkTelegramConnection(
   }
 
   try {
-    console.log(
+    appLogger.notice(
       savedSession
         ? 'Підключення зі збереженою сесією...'
         : 'Перша авторизація в Telegram...',
@@ -135,7 +142,7 @@ export async function checkTelegramConnection(
 
       phoneCode: (_isCodeViaApp, info) => {
         if (info) {
-          console.log(`Спосіб доставки коду: ${info.type}`);
+          appLogger.notice(`Спосіб доставки коду: ${info.type}`);
         }
 
         return ask('Код входу: ', true);
@@ -162,16 +169,9 @@ export async function checkTelegramConnection(
 
     await saveSession(session.save());
 
-    const me = await client.getMe();
-
-    console.log('Підключення до Telegram успішне.');
-    console.log('ID акаунта:', me.id.toString());
-    console.log('Ім’я:', me.firstName ?? 'не вказано');
-    console.log(
-      'Username:',
-      me.username ? `@${me.username}` : 'не вказано',
-    );
-    console.log('Сесію збережено локально.');
+    await client.getMe();
+    appLogger.technical('info', 'telegram.connected', { authorized: true });
+    appLogger.notice('Сесію збережено локально.');
     readline.close();
 
     // Ця функція працює до /quit або Ctrl+C.
@@ -186,6 +186,12 @@ export async function checkTelegramConnection(
     config.targetUsername,
     describeError,
     gemini,
+    appLogger,
+    { service: createVoiceService({ apiKey: config.geminiApiKey,
+        ...(config.transcriptionModel ? { transcriptionModel: config.transcriptionModel } : {}),
+        ...(config.ttsModel ? { ttsModel: config.ttsModel } : {}),
+        ...(config.ttsVoice ? { voice: config.ttsVoice } : {}) }),
+      convert: createOpusConverter(config.ffmpegPath) },
     );
 
 
@@ -199,6 +205,9 @@ export async function checkTelegramConnection(
 
 export function describeError(error: unknown): string {
   const messages: Record<string, string> = {
+    VOICE_API: 'Помилка Gemini Audio. Перевір доступ до моделей та квоти.',
+    VOICE_RATE_LIMIT: 'Вичерпано квоту Gemini Audio; пауза 60 секунд.',
+    VOICE_FFMPEG: 'Не вдалося конвертувати аудіо. Перевір FFmpeg.',
     BOOKING_CONFIG: 'Некоректні BOOKING_RESTAURANT, BOOKING_TIME або BOOKING_GUESTS.',
     BOOKING_PAST: 'Час бронювання за Europe/London уже настав або минув. Нову дату автоматично не обрано.',
     BOOKING_UNAVAILABLE: 'Менеджер відмовив у бронюванні на задані параметри.',

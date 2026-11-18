@@ -8,6 +8,7 @@ coverage/
 !.env.example
 
 .sessions/
+logs/
 
 *.log
 .DS_Store

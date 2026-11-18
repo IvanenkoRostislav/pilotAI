@@ -1,4 +1,5 @@
 import { loadConfig } from './config/env.js';
+import { logger, errorInfo } from './modules/logger/logger.js';
 import {
     checkTelegramConnection,
     describeError,
@@ -11,6 +12,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-    console.error('Помилка:', describeError(error));
+    logger.technical('error', 'app.failed', errorInfo(error));
+    logger.notice('Помилка: ' + describeError(error));
     process.exitCode = 1;
 });

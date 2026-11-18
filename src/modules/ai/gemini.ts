@@ -6,8 +6,10 @@ import {
 } from '@google/genai';
 
 import { SYSTEM_PROMPT } from './system-prompt.js';
+import { logger, errorInfo, type Logger } from '../logger/logger.js';
 
 interface ReplyOptions {
+  bookingSessionId?: string | null;
   systemInstruction?: string;
   contents?: Content[];
   responseJsonSchema?: Record<string, unknown>;
@@ -16,9 +18,11 @@ interface ReplyOptions {
 interface GeminiConfig {
   apiKey: string;
   model: string;
+  audit?: Logger;
 }
 
 export function createGeminiService(config: GeminiConfig) {
+  const audit = config.audit ?? logger;
   const ai = new GoogleGenAI({
     apiKey: config.apiKey,
     httpOptions: {
@@ -75,10 +79,9 @@ export function createGeminiService(config: GeminiConfig) {
       }
 
       if (error instanceof ApiError) {
-        console.error('Gemini API:', {
-        model: config.model,
-        status: error.status,
-        });
+        audit.technical('error', 'gemini.api_error', {
+          model: config.model, status: error.status,
+        }, options.bookingSessionId ?? null);
         if (error.status === 429) {
           pausedUntil = Date.now() + 60_000;
           throw new Error('GEMINI_RATE_LIMIT');
@@ -101,6 +104,7 @@ export function createGeminiService(config: GeminiConfig) {
         );
       }
 
+      audit.technical('error', 'gemini.network_error', errorInfo(error), options.bookingSessionId ?? null);
       throw new Error('GEMINI_NETWORK');
     }
 
