@@ -14,6 +14,8 @@ interface Message {
   text: string;
   // Only code-validated booking phrases may opt in; arbitrary text is omitted.
   trustedText?: boolean;
+  retainText?: boolean;
+  messageType?: 'TEXT' | 'MEDIA';
 }
 export interface MessageLog {
   finish(explanation: Explanation): void;
@@ -63,13 +65,6 @@ export class Logger {
   newBookingId(): string { return randomUUID(); }
   rememberPrivate(value: string): void { this.redactor.remember(value); }
 
-  transcript(direction: 'IN' | 'OUT', text: string, bookingSessionId: string | null): void {
-    const timestamp = this.clock().toISOString();
-    this.write('agent', { timestamp, event: 'voice.transcript', direction,
-      bookingSessionId: this.sessionId(bookingSessionId),
-      transcript: this.redactor.text(text) }, timestamp, direction);
-  }
-
   notice = (message: string): void => {
     this.technical('info', 'console.notice', { message });
   };
@@ -97,7 +92,10 @@ export class Logger {
         timestamp, event: 'conversation.message',
         bookingSessionId: this.sessionId(message.bookingSessionId),
         direction: message.direction,
-        text: this.redactor.conversation(message.text, message.trustedText === true),
+        sender: message.direction === 'IN' ? 'manager' : 'agent',
+        messageType: message.messageType ?? 'TEXT',
+        text: message.retainText ? this.redactor.text(message.text) :
+          this.redactor.conversation(message.text, message.trustedText === true),
         understood: this.redactor.text(explanation.understood),
         decision: this.redactor.text(explanation.decision),
         state: ['IDLE', 'NEGOTIATING', 'NEEDS_INPUT', 'CONFIRMING', 'COMPLETED', 'FAILED', 'CANCELLED'].includes(explanation.state)

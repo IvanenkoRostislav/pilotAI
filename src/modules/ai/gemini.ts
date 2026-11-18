@@ -6,6 +6,7 @@ import {
 } from '@google/genai';
 
 import { SYSTEM_PROMPT } from './system-prompt.js';
+import { setTimeout as delay } from 'node:timers/promises';
 import { logger, errorInfo, type Logger } from '../logger/logger.js';
 
 interface ReplyOptions {
@@ -19,6 +20,8 @@ interface GeminiConfig {
   apiKey: string;
   model: string;
   audit?: Logger;
+  retryDelayMs?: number;
+  fallbackModel?: string;
 }
 
 export function createGeminiService(config: GeminiConfig) {
@@ -55,58 +58,81 @@ export function createGeminiService(config: GeminiConfig) {
     }
 
     let response;
+    const backup = config.fallbackModel ?? 'gemini-3.5-flash-lite';
+    const models = [...new Set([config.model, backup].filter(Boolean))];
 
-    try {
-      response = await ai.models.generateContent({
-        model: config.model,
-        contents: options.contents ?? [
-          ...history,
-          { role: 'user', parts: [{ text }] },
-        ],
-        config: {
-          systemInstruction: options.systemInstruction ?? SYSTEM_PROMPT,
-          ...(options.responseJsonSchema ? {
-            responseMimeType: 'application/json',
-            responseJsonSchema: options.responseJsonSchema,
-          } : {}),
-          maxOutputTokens: 4096,
-          abortSignal: signal,
-        },
-      });
-    } catch (error) {
-      if (signal.aborted) {
-        throw new Error('GEMINI_CANCELLED');
-      }
-
-      if (error instanceof ApiError) {
-        audit.technical('error', 'gemini.api_error', {
-          model: config.model, status: error.status,
-        }, options.bookingSessionId ?? null);
-        if (error.status === 429) {
-          pausedUntil = Date.now() + 60_000;
-          throw new Error('GEMINI_RATE_LIMIT');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const model = models[Math.min(attempt, models.length - 1)]!;
+      try {
+        signal.throwIfAborted();
+        response = await ai.models.generateContent({
+          model,
+          contents: options.contents ?? [
+            ...history,
+            { role: 'user', parts: [{ text }] },
+          ],
+          config: {
+            systemInstruction: options.systemInstruction ?? SYSTEM_PROMPT,
+            ...(options.responseJsonSchema ? {
+              responseMimeType: 'application/json',
+              responseJsonSchema: options.responseJsonSchema,
+            } : {}),
+            maxOutputTokens: 4096,
+            abortSignal: signal,
+          },
+        });
+        break;
+      } catch (error) {
+        if (signal.aborted) {
+          throw new Error('GEMINI_CANCELLED');
         }
 
-        const codes: Record<number, string> = {
-          400: 'GEMINI_BAD_REQUEST',
-          401: 'GEMINI_AUTH',
-          403: 'GEMINI_AUTH',
-          404: 'GEMINI_MODEL',
-          402: 'GEMINI_BILLING',
-        };
+        if (error instanceof ApiError) {
+          audit.technical('error', 'gemini.api_error', {
+            model, status: error.status,
+          }, options.bookingSessionId ?? null);
+          if ((error.status === 408 || error.status >= 500 ||
+            (error.status === 404 && attempt === 0 && models.length > 1)) && attempt < 2) {
+            audit.technical('warn', 'gemini.retry', { attempt: attempt + 1, status: error.status,
+              model, nextModel: models[Math.min(attempt + 1, models.length - 1)] }, options.bookingSessionId ?? null);
+            try { await delay((config.retryDelayMs ?? 500) * (attempt + 1), undefined, { signal }); }
+            catch { throw new Error('GEMINI_CANCELLED'); }
+            continue;
+          }
+          if (error.status === 429) {
+            pausedUntil = Date.now() + 60_000;
+            throw new Error('GEMINI_RATE_LIMIT');
+          }
 
-        if (error.status >= 500 || error.status === 408) {
-          throw new Error('GEMINI_UNAVAILABLE');
+          const codes: Record<number, string> = {
+            400: 'GEMINI_BAD_REQUEST',
+            401: 'GEMINI_AUTH',
+            403: 'GEMINI_AUTH',
+            404: 'GEMINI_MODEL',
+            402: 'GEMINI_BILLING',
+          };
+
+          if (error.status >= 500 || error.status === 408) {
+            throw new Error('GEMINI_UNAVAILABLE');
+          }
+
+          throw new Error(
+            codes[error.status] ?? 'GEMINI_API',
+          );
         }
 
-        throw new Error(
-          codes[error.status] ?? 'GEMINI_API',
-        );
+        audit.technical('error', 'gemini.network_error', errorInfo(error), options.bookingSessionId ?? null);
+        if (attempt < 2) {
+          audit.technical('warn', 'gemini.retry', { attempt: attempt + 1 }, options.bookingSessionId ?? null);
+          try { await delay((config.retryDelayMs ?? 500) * (attempt + 1), undefined, { signal }); }
+          catch { throw new Error('GEMINI_CANCELLED'); }
+          continue;
+        }
+        throw new Error('GEMINI_NETWORK');
       }
-
-      audit.technical('error', 'gemini.network_error', errorInfo(error), options.bookingSessionId ?? null);
-      throw new Error('GEMINI_NETWORK');
     }
+
+    if (!response) throw new Error('GEMINI_UNAVAILABLE');
 
     const candidate = response.candidates?.[0];
 

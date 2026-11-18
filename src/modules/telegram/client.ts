@@ -10,8 +10,6 @@ import { StringSession } from 'teleproto/sessions';
 import { runMessaging } from './messanging.js';
 
 import { createGeminiService } from '../ai/gemini.js';
-import { createVoiceService } from '../ai/voice.js';
-import { createOpusConverter } from '../audio/opus.js';
 
 const sessionDirectory = resolve('.sessions');
 const sessionFile = resolve(sessionDirectory, 'telegram.session');
@@ -22,10 +20,7 @@ interface TelegramConfig {
     targetUsername: string;
     geminiApiKey: string;
     geminiModel: string;
-    transcriptionModel?: string;
-    ttsModel?: string;
-    ttsVoice?: string;
-    ffmpegPath?: string;
+    fallbackModel?: string;
 }
 
 async function loadSession(): Promise<string> {
@@ -179,6 +174,7 @@ export async function checkTelegramConnection(
     const gemini = createGeminiService({
     apiKey: config.geminiApiKey,
     model: config.geminiModel,
+    ...(config.fallbackModel ? { fallbackModel: config.fallbackModel } : {}),
     });
 
     await runMessaging(
@@ -187,11 +183,6 @@ export async function checkTelegramConnection(
     describeError,
     gemini,
     appLogger,
-    { service: createVoiceService({ apiKey: config.geminiApiKey,
-        ...(config.transcriptionModel ? { transcriptionModel: config.transcriptionModel } : {}),
-        ...(config.ttsModel ? { ttsModel: config.ttsModel } : {}),
-        ...(config.ttsVoice ? { voice: config.ttsVoice } : {}) }),
-      convert: createOpusConverter(config.ffmpegPath) },
     );
 
 
@@ -205,9 +196,10 @@ export async function checkTelegramConnection(
 
 export function describeError(error: unknown): string {
   const messages: Record<string, string> = {
-    VOICE_API: 'Помилка Gemini Audio. Перевір доступ до моделей та квоти.',
-    VOICE_RATE_LIMIT: 'Вичерпано квоту Gemini Audio; пауза 60 секунд.',
-    VOICE_FFMPEG: 'Не вдалося конвертувати аудіо. Перевір FFmpeg.',
+    AGENT_UNSAFE_REPLY: 'Запропоновану AI-відповідь відхилено після повторної перевірки. Перевір останню репліку менеджера.',
+    AGENT_UNGROUNDED_DETAILS: 'AI запропонував невідомі дані гостя. Повідомлення не надіслано.',
+    AGENT_UNGROUNDED_RESTAURANT: 'Назву ресторану не вдалося підтвердити з повідомлень менеджера.',
+    AGENT_OWNER_INPUT_NOT_DELIVERED: 'AI не включив надані тобою дані у відповідь. Повідомлення не надіслано.',
     BOOKING_CONFIG: 'Некоректні BOOKING_RESTAURANT, BOOKING_TIME або BOOKING_GUESTS.',
     BOOKING_PAST: 'Час бронювання за Europe/London уже настав або минув. Нову дату автоматично не обрано.',
     BOOKING_UNAVAILABLE: 'Менеджер відмовив у бронюванні на задані параметри.',

@@ -31,7 +31,7 @@ test('creates logs directory and separates technical events from message decisio
   f.logger.message({ bookingSessionId: id, direction: 'IN', text: 'Hello' }).finish(summary);
   assert.deepEqual(readdirSync(f.directory).sort(), ['agent-2026-11-17.jsonl', 'technical-2026-11-17.jsonl']);
   const row = f.rows('agent')[0];
-  assert.deepEqual(Object.keys(row).sort(), ['bookingSessionId', 'decision', 'direction', 'event', 'state', 'text', 'timestamp', 'understood'].sort());
+  assert.deepEqual(Object.keys(row).sort(), ['bookingSessionId', 'decision', 'direction', 'event', 'sender', 'messageType', 'state', 'text', 'timestamp', 'understood'].sort());
   assert.equal(row.timestamp, '2026-11-17T12:34:56.000Z');
   assert.equal(row.bookingSessionId, id);
   assert.equal(row.decision, 'confirm');
@@ -142,18 +142,20 @@ test('API error metadata does not include error message, request, stack or crede
   assert.deepEqual(errorInfo(new Error('GEMINI_RATE_LIMIT')), { errorCode: 'GEMINI_RATE_LIMIT' });
 });
 
-test('voice transcripts retain speech text while masking known private values and contact details', (t) => {
+test('text messages retain conversation content while masking known private values and contact details', (t) => {
   const f = fixture(t);
   f.logger.rememberPrivate('Alex Private');
   const id = f.logger.newBookingId();
-  f.logger.transcript('IN', 'Please book for Alex Private, alex@example.com, +447700900000', id);
-  f.logger.transcript('OUT', 'Thank you for confirming.', id);
+  f.logger.message({ bookingSessionId: id, direction: 'IN', retainText: true,
+    text: 'Please book for Alex Private, alex@example.com, +447700900000' }).finish(summary);
+  f.logger.message({ bookingSessionId: id, direction: 'OUT', retainText: true,
+    text: 'Thank you for confirming.' }).finish(summary);
   const rows = f.rows('agent');
-  assert.equal(rows[0].event, 'voice.transcript');
+  assert.equal(rows[0].event, 'conversation.message');
   assert.equal(rows[0].bookingSessionId, id);
-  assert.match(rows[0].transcript, /Please book for/);
+  assert.match(rows[0].text, /Please book for/);
   assert.ok(!JSON.stringify(rows).includes('Alex Private'));
   assert.ok(!JSON.stringify(rows).includes('alex@example.com'));
   assert.ok(!JSON.stringify(rows).includes('+447700900000'));
-  assert.equal(rows[1].transcript, 'Thank you for confirming.');
+  assert.equal(rows[1].text, 'Thank you for confirming.');
 });

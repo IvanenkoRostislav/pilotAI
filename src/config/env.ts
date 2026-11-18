@@ -54,10 +54,7 @@ return {
   targetUsername,
   geminiApiKey,
   geminiModel,
-  transcriptionModel: process.env.GEMINI_TRANSCRIPTION_MODEL?.trim() || 'gemini-3.1-flash-lite',
-  ttsModel: process.env.GEMINI_TTS_MODEL?.trim() || 'gemini-3.1-flash-tts-preview',
-  ttsVoice: process.env.GEMINI_TTS_VOICE?.trim() || 'Kore',
-  ffmpegPath: process.env.FFMPEG_PATH?.trim() || 'ffmpeg',
+  fallbackModel: process.env.GEMINI_FALLBACK_MODEL?.trim() || 'gemini-3.5-flash-lite',
 };
 
 }
