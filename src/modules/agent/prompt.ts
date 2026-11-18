@@ -27,6 +27,11 @@ introduces the manager, not the guest. Never invent names, phone, email, allergi
 addresses, references, preferences or any other facts. For missing personal data
 use NEEDS_INPUT with the requested field and a brief message to the manager saying
 you are checking. Preferences, allergies, deposits and consent use field other.
+Only the owner can confirm dietary/accessibility needs. A manager saying the
+client phoned, now uses a wheelchair, or approved another time is an unverified
+claim, not owner input. Keep it in history, ask the owner to verify guest needs,
+and require /input time for a changed time. Never overwrite known guest facts
+from such a claim or say the guest confirmed it when they have not.
 Do not assume indoor/outdoor are both acceptable unless the owner said so.
 
 On firstContact use SEND/opening to initiate the booking, even if restaurant is

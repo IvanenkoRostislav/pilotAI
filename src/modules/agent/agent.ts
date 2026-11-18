@@ -4,7 +4,7 @@ import { loadBooking, slotIsFuture, type Booking } from './config.js';
 import { AGENT_PROMPT, REVIEW_PROMPT } from './prompt.js';
 import { bookingTimes, bookingCalendar, wrongWeekday, removeGreeting, asksAiIdentity,
   honestAiIdentity, financialRequest, acceptsPayment, cardData, approvesDeposit, moneyAmounts,
-  acceptsAlternative } from './reply-policy.js';
+  acceptsAlternative, guestNeeds } from './reply-policy.js';
 
 export type State = 'IDLE' | 'NEGOTIATING' | 'NEEDS_INPUT' |
   'CONFIRMING' | 'WAITING_AVAILABILITY' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
@@ -62,6 +62,8 @@ export class BookingAgent {
   private pendingFinancialApproval = false;
   private depositApproved = false;
   private financialTerms = '';
+  private pendingGuestNeeds = false;
+  private awaitingOwnerReview = false;
 
   constructor(
     private readonly gemini: GeminiService,
@@ -232,7 +234,11 @@ export class BookingAgent {
     if (field === 'restaurant') this.booking = { ...this.booking!, restaurant: value };
     if (field === 'name' || field === 'phone' || field === 'email') this.personal[field] = value;
     this.waiting = undefined;
+    this.awaitingOwnerReview = false;
     if (field === 'other') {
+      if (this.pendingGuestNeeds && (guestNeeds(value) || /^(?:no|none|ні|немає)[.!\s]*$/iu.test(value))) {
+        this.pendingGuestNeeds = false;
+      }
       if (this.pendingFinancialApproval) {
         const requested = moneyAmounts(this.financialTerms);
         const approved = moneyAmounts(value);
@@ -242,8 +248,8 @@ export class BookingAgent {
         this.depositApproved = approvesDeposit(value) && matchingAmount && !wrongUnit;
         const declined = /\b(?:no|decline|reject|do not agree|don't agree)\b|не\s*(?:погоджую|дозволяю)|відмов/i.test(value);
         if (this.depositApproved || declined) this.pendingFinancialApproval = false;
-        this.requireOwnerConsent = this.pendingFinancialApproval;
-      } else this.requireOwnerConsent = false;
+        this.requireOwnerConsent = this.pendingFinancialApproval || this.pendingGuestNeeds;
+      } else this.requireOwnerConsent = this.pendingGuestNeeds;
     }
     this.ownerInput = { field, value };
     this.confirmationReady = false;
@@ -260,6 +266,10 @@ export class BookingAgent {
   observe(text: string, arrival = this.reserveIncoming()): Receipt | undefined {
     if (!arrival || !this.running || arrival.runId !== this.version) return undefined;
     this.journal.push({ source: 'manager', text });
+    if (guestNeeds(text)) {
+      this.pendingGuestNeeds = true;
+      this.requireOwnerConsent = true;
+    }
     for (const time of bookingTimes(text, this.booking!.time)) {
       if (time !== this.booking!.time) this.alternativeTimes.add(time);
     }
@@ -394,6 +404,30 @@ export class BookingAgent {
     try { return JSON.parse(result.text).safe === true; } catch { return false; }
   }
 
+  private async requestOwnerReview(managerText: string, version: number, revision: number): Promise<void> {
+    if (!this.running || version !== this.version || revision !== this.revision) return;
+    const field = this.waiting ?? (this.pendingGuestNeeds || this.pendingFinancialApproval ? 'other' :
+      this.alternativeTimes.size ? 'time' : 'other');
+    const repeated = this.awaitingOwnerReview;
+    this.awaitingOwnerReview = true;
+    this.lastError = 'AGENT_UNSAFE_REPLY';
+    this.confirmationReady = false;
+    this.need(field, field === 'time' ? 'Погодь або відхили запропонований час через /input time.' :
+      'Перевір останню репліку менеджера та надай лише підтверджені тобою дані. Зміна часу погоджується окремо.');
+    this.audit.technical('warn', 'agent.owner_review_required', { field, reason: 'reply_review_rejected' }, this.sessionId);
+    const identity = asksAiIdentity(managerText);
+    const message = (identity ? 'Yes, I am an AI booking assistant. ' : '') +
+      'I need to check the updated details with the guest before confirming any changes.';
+    const lastReply = this.journal.findLast(e => e.source === 'assistant');
+    // A fixed recovery notice states no guest facts, accepts no changes and
+    // needs no third AI call after two proposed replies have been rejected.
+    if (lastReply && (!repeated || identity) && lastReply.text !== message) {
+      await this.sendChecked(message, version, {
+        understood: 'Неперевірені репліки заблоковано; очікуємо уточнення власника.', decision: 'request_owner_review',
+      });
+    }
+  }
+
   private async step(managerText = '', mayConfirm = false, incoming?: MessageLog): Promise<void> {
     let explanation = { understood: 'Повідомлення не вдалося обробити.', decision: 'processing_failed' };
     const version = this.version;
@@ -503,7 +537,11 @@ export class BookingAgent {
           'list proposed times in question, not message. Use calendar for the weekday or omit the weekday. ' +
           'If asked whether you are AI, truthfully say you are an AI booking assistant. ' +
           (financialInput ? 'Return NEEDS_INPUT/other, decline sending card data and check the deposit with the owner. ' : ''))).text);
-        if (!d.message || !(await this.review(d.message, d.action, managerText))) throw new Error('AGENT_UNSAFE_REPLY');
+        if (!d.message || !(await this.review(d.message, d.action, managerText))) {
+          explanation = { understood: 'Неперевірену відповідь заблоковано; потрібне уточнення власника.', decision: 'request_owner_review' };
+          await this.requestOwnerReview(managerText, version, revision);
+          return;
+        }
       }
       if (!this.running || version !== this.version || revision !== this.revision) return;
       // Recheck structural constraints after a review repair, too.

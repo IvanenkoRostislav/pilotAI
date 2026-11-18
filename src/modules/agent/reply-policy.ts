@@ -91,3 +91,7 @@ export function moneyAmounts(text: string): string[] {
 export function acceptsAlternative(text: string): boolean {
   return /\b(?:later|alternative|either|both|that time|that slot)\b[^.!?\n]{0,24}\b(?:works?|fine|perfect|lovely|suits?|acceptable)\b|\b(?:that works|sounds good)\b|\b(?:I|we)(?:['’]ll| will| can| would like to)?\s+(?:please\s+)?(?:take|accept|book|go for|go ahead with)\s+(?:it|that|either|the later|the alternative)\b/i.test(text);
 }
+
+export function guestNeeds(text: string): boolean {
+  return /\b(?:dietary|allerg\w*|accessib\w*|wheelchair|mobility|medical needs|special needs)\b|алергі|доступніст|візок|дієт|особлив\w* потреб/iu.test(text);
+}

@@ -576,6 +576,8 @@ test('repeated internal metadata is never delivered after a repair', async () =>
     { ...send('opening'), message: 'firstContact: Hello, may I book?' }], { review: () => true });
   await s.agent.start();
   assert.equal(s.status().lastError, 'AGENT_UNSAFE_REPLY');
+  assert.equal(s.status().state, 'NEEDS_INPUT');
+  assert.equal(s.status().needsInput, 'other');
   assert.equal(s.outgoing.length, 0);
 });
 
