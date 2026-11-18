@@ -2,10 +2,13 @@ import { logger, Logger, errorInfo, type MessageLog, type Explanation } from '..
 import type { GeminiService } from '../ai/gemini.js';
 import { loadBooking, slotIsFuture, type Booking } from './config.js';
 import { AGENT_PROMPT, REVIEW_PROMPT } from './prompt.js';
+import { bookingTimes, bookingCalendar, wrongWeekday, removeGreeting, asksAiIdentity,
+  honestAiIdentity, financialRequest, acceptsPayment, cardData, approvesDeposit, moneyAmounts,
+  acceptsAlternative } from './reply-policy.js';
 
 export type State = 'IDLE' | 'NEGOTIATING' | 'NEEDS_INPUT' |
-  'CONFIRMING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
-type Field = 'restaurant' | 'name' | 'phone' | 'email' | 'other';
+  'CONFIRMING' | 'WAITING_AVAILABILITY' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+type Field = 'restaurant' | 'name' | 'phone' | 'email' | 'time' | 'other';
 export interface Arrival { runId: number; revision: number; mayConfirm: boolean }
 export interface Receipt extends Arrival { text: string; audit: MessageLog }
 type Entry = { source: 'owner' | 'manager' | 'assistant' | 'system'; text: string };
@@ -13,17 +16,18 @@ type Decision = {
   action: 'SEND' | 'NEEDS_INPUT' | 'CONFIRMED' | 'UNAVAILABLE';
   messageKey: string;
   message: string;
-  field: 'name' | 'phone' | 'email' | 'restaurant' | 'other' | 'none';
+  field: Field | 'none';
   question: string;
   restaurantName?: string;
   restaurantEvidence?: string;
 };
-const active = new Set<State>(['NEGOTIATING', 'NEEDS_INPUT', 'CONFIRMING']);
+const active = new Set<State>(['NEGOTIATING', 'NEEDS_INPUT', 'CONFIRMING', 'WAITING_AVAILABILITY']);
 const transitions: Record<State, State[]> = {
   IDLE: ['NEGOTIATING', 'FAILED'],
-  NEGOTIATING: ['NEEDS_INPUT', 'CONFIRMING', 'COMPLETED', 'FAILED', 'CANCELLED'],
-  NEEDS_INPUT: ['NEGOTIATING', 'CONFIRMING', 'FAILED', 'CANCELLED'],
-  CONFIRMING: ['NEGOTIATING', 'NEEDS_INPUT', 'COMPLETED', 'FAILED', 'CANCELLED'],
+  NEGOTIATING: ['NEEDS_INPUT', 'CONFIRMING', 'WAITING_AVAILABILITY', 'COMPLETED', 'FAILED', 'CANCELLED'],
+  NEEDS_INPUT: ['NEGOTIATING', 'CONFIRMING', 'WAITING_AVAILABILITY', 'FAILED', 'CANCELLED'],
+  CONFIRMING: ['NEGOTIATING', 'NEEDS_INPUT', 'WAITING_AVAILABILITY', 'COMPLETED', 'FAILED', 'CANCELLED'],
+  WAITING_AVAILABILITY: ['NEGOTIATING', 'NEEDS_INPUT', 'CONFIRMING', 'COMPLETED', 'FAILED', 'CANCELLED'],
   COMPLETED: [], FAILED: [], CANCELLED: [],
 };
 
@@ -53,6 +57,11 @@ export class BookingAgent {
   private ownerInput: { field: string; value: string } | undefined;
   private requireOwnerConsent = false;
   private retryContext: { managerText: string; mayConfirm: boolean } | undefined;
+  private readonly alternativeTimes = new Set<string>();
+  private originalBooking?: Booking;
+  private pendingFinancialApproval = false;
+  private depositApproved = false;
+  private financialTerms = '';
 
   constructor(
     private readonly gemini: GeminiService,
@@ -77,6 +86,7 @@ export class BookingAgent {
       needsInput: this.waiting, entries: this.journal.length,
       knownPersonalFields: Object.keys(this.personal),
       managerConfirmed: this.managerConfirmed, lastError: this.lastError,
+      alternativeTimes: [...this.alternativeTimes],
     }, null, 2));
   }
 
@@ -123,8 +133,12 @@ export class BookingAgent {
     if (question) this.log(question);
     this.audit.technical('info', 'agent.input_required', { field }, this.sessionId);
     this.log('Введи /input ' + field + ' значення або /stop.');
+    if (field === 'time') {
+      this.log('Запропоновані менеджером години: ' + [...this.alternativeTimes].join(', ') +
+        '. Явний дозвіл: /input time HH:mm; відмова від альтернатив: /input time no. Ім’я або відповідь менеджера не погоджують зміну часу.');
+    }
     if (field === 'other') {
-      this.log('Дата, час і кількість гостей заблоковані. Для зміни: /stop, нова конфігурація і перезапуск.');
+      this.log('Дата й кількість гостей зафіксовані. Інший час потребує окремого запиту /input time HH:mm. Карткові реквізити не вводь.');
     }
   }
 
@@ -146,6 +160,7 @@ export class BookingAgent {
     this.abort = new AbortController();
     try {
       this.booking = loadBooking(this.now());
+      this.originalBooking = { ...this.booking };
       for (const field of ['name', 'phone', 'email'] as const) {
         const value = process.env['BOOKING_' + field.toUpperCase()]?.trim();
         if (value) {
@@ -184,6 +199,10 @@ export class BookingAgent {
       return;
     }
     value = value.trim();
+    if (cardData(value, this.pendingFinancialApproval)) {
+      this.log('Карткові реквізити не приймаються і не надсилаються в Telegram або AI. Для оплати потрібен окремий захищений спосіб.');
+      return;
+    }
     if (!value || value.length > 200 || /[\r\n]/.test(value) ||
         (field === 'restaurant' && value.length > 100) ||
         (field === 'phone' && !/^\+?[\d ()-]{6,30}$/.test(value)) ||
@@ -191,13 +210,41 @@ export class BookingAgent {
       this.log('Некоректне значення. Повтори /input або /stop.');
       return;
     }
-    this.audit.rememberPrivate(value);
+    if (field === 'time') {
+      if (/^(?:no|decline|ні)$/iu.test(value)) {
+        value = 'decline';
+        this.alternativeTimes.clear();
+        this.audit.technical('info', 'agent.time_declined', { requestedTime: this.booking!.time }, this.sessionId);
+      } else {
+        if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(value) || !this.alternativeTimes.has(value) ||
+          !slotIsFuture({ ...this.booking!, time: value }, this.now())) {
+          this.log('Вкажи запропонований майбутній час: /input time HH:mm; або відмовся: /input time no.');
+          return;
+        }
+        const previousTime = this.booking!.time;
+        this.booking = { ...this.booking!, time: value };
+        this.alternativeTimes.clear();
+        this.audit.technical('info', 'agent.time_approved', { previousTime, approvedTime: value }, this.sessionId);
+      }
+    } else this.audit.rememberPrivate(value);
     this.audit.technical('info', 'agent.input_received', { field }, this.sessionId);
     this.journal.push({ source: 'owner', text: field + ': ' + value });
     if (field === 'restaurant') this.booking = { ...this.booking!, restaurant: value };
     if (field === 'name' || field === 'phone' || field === 'email') this.personal[field] = value;
     this.waiting = undefined;
-    if (field === 'other') this.requireOwnerConsent = false;
+    if (field === 'other') {
+      if (this.pendingFinancialApproval) {
+        const requested = moneyAmounts(this.financialTerms);
+        const approved = moneyAmounts(value);
+        const matchingAmount = !approved.length || (requested.length > 0 &&
+          approved.every(a => requested.includes(a)) && requested.every(a => approved.includes(a)));
+        const wrongUnit = /\btotal\b|загалом/i.test(value) && /\bper (?:person|guest)|\beach\b/i.test(this.financialTerms);
+        this.depositApproved = approvesDeposit(value) && matchingAmount && !wrongUnit;
+        const declined = /\b(?:no|decline|reject|do not agree|don't agree)\b|не\s*(?:погоджую|дозволяю)|відмов/i.test(value);
+        if (this.depositApproved || declined) this.pendingFinancialApproval = false;
+        this.requireOwnerConsent = this.pendingFinancialApproval;
+      } else this.requireOwnerConsent = false;
+    }
     this.ownerInput = { field, value };
     this.confirmationReady = false;
     this.move('NEGOTIATING');
@@ -213,6 +260,18 @@ export class BookingAgent {
   observe(text: string, arrival = this.reserveIncoming()): Receipt | undefined {
     if (!arrival || !this.running || arrival.runId !== this.version) return undefined;
     this.journal.push({ source: 'manager', text });
+    for (const time of bookingTimes(text, this.booking!.time)) {
+      if (time !== this.booking!.time) this.alternativeTimes.add(time);
+    }
+    if (financialRequest(text)) {
+      const signature = (s: string) => moneyAmounts(s).join(',') + ':' + /\bper (?:person|guest)|\beach\b/i.test(s);
+      if (!this.financialTerms || signature(text) !== signature(this.financialTerms) || !this.depositApproved) {
+        this.financialTerms = text;
+        this.pendingFinancialApproval = true;
+        this.depositApproved = false;
+        this.requireOwnerConsent = true;
+      }
+    }
     const audit = this.audit.message({
       bookingSessionId: this.sessionId, direction: 'IN', text, retainText: true,
     });
@@ -267,13 +326,7 @@ export class BookingAgent {
 
   private conflicts(text: string): boolean {
     const b = this.booking!;
-    for (const match of text.matchAll(/\b(\d{1,2}):([0-5]\d)\b(?!\s*[ap]\.?m)/gi)) {
-      if (match[1]!.padStart(2, '0') + ':' + match[2] !== b.time) return true;
-    }
-    for (const match of text.matchAll(/\b(\d{1,2})(?::([0-5]\d))?\s*([ap])\.?m\.?/gi)) {
-      const hour = Number(match[1]) % 12 + (match[3]!.toLowerCase() === 'p' ? 12 : 0);
-      if (String(hour).padStart(2, '0') + ':' + (match[2] ?? '00') !== b.time) return true;
-    }
+    if (bookingTimes(text, b.time).some(time => time !== b.time)) return true;
     for (const match of text.matchAll(/\b\d{4}-\d{2}-\d{2}\b/g)) if (match[0] !== b.date) return true;
     const counts: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6 };
     for (const match of text.matchAll(/\b(?:table|party|booking|reservation) for (\d+|one|two|three|four|five|six)\b/gi)) {
@@ -284,6 +337,8 @@ export class BookingAgent {
 
   private payload() {
     return { booking: this.booking, personal: this.personal, state: this.state,
+      originalBooking: this.originalBooking, calendar: bookingCalendar(this.booking!.date),
+      alternativeTimes: [...this.alternativeTimes], depositApproved: this.depositApproved,
       transcript: this.journal, waiting: this.waiting, ownerInput: this.ownerInput,
       firstContact: !this.journal.some(e => e.source === 'assistant'),
       mayConfirm: this.canConfirm, requireOwnerConsent: this.requireOwnerConsent };
@@ -309,12 +364,26 @@ export class BookingAgent {
   }
 
   private hasInternalText(message: string): boolean {
-    return /\b(?:londonNow|restaurantEvidence|restaurantName|firstContact|decisionFeedback|bookingSessionId|ownerInput|messageKey|responseJsonSchema|systemInstruction)\b/i.test(message);
+    return /\b(?:londonNow|restaurantEvidence|restaurantName|firstContact|decisionFeedback|bookingSessionId|ownerInput|messageKey|responseJsonSchema|systemInstruction|originalBooking|alternativeTimes|depositApproved)\b/i.test(message);
   }
 
-  private async review(message: string, action: string): Promise<boolean> {
+  private replyIssue(message: string, managerText = ''): string | undefined {
+    if (this.hasInternalText(message)) return 'internal_metadata';
+    if (wrongWeekday(message, this.booking!.date)) return 'incorrect_weekday';
+    const times = bookingTimes(message, this.booking!.time);
+    if (times.some(t => t !== this.booking!.time)) return 'unapproved_time';
+    if ((this.alternativeTimes.size || /\b(?:later|alternative|either)\b/i.test(message)) &&
+      !times.includes(this.booking!.time) && acceptsAlternative(message)) return 'unapproved_time';
+    if (cardData(message, this.pendingFinancialApproval || /\b(?:card|expiry|expiration)\b/i.test(this.financialTerms))) return 'card_data';
+    if (/\b(?:payment|deposit)\s+(?:has been|is)\s+paid|\b(?:I|we)\s+(?:have paid|paid)\b/i.test(message)) return 'unsupported_payment_claim';
+    if (!this.depositApproved && acceptsPayment(message)) return 'unapproved_payment';
+    if (asksAiIdentity(managerText) && !honestAiIdentity(message)) return 'ai_identity_required';
+    return undefined;
+  }
+
+  private async review(message: string, action: string, managerText = ''): Promise<boolean> {
     // Never trust an AI-only review to catch copied implementation identifiers.
-    if (this.hasInternalText(message)) return false;
+    if (this.replyIssue(message, managerText)) return false;
     const result = await this.gemini.generateReply('Verify proposed reply.', this.abort.signal, {
       systemInstruction: REVIEW_PROMPT, bookingSessionId: this.sessionId,
       contents: [{ role: 'user', parts: [{ text: JSON.stringify({ ...this.payload(),
@@ -335,15 +404,16 @@ export class BookingAgent {
       this.retryContext = undefined;
       this.lastError = '';
       const firstContact = this.payload().firstContact;
+      const financialInput = financialRequest(managerText) && !this.depositApproved;
       const keys = ['opening', 'opening_polite', 'reply', 'repeat', 'confirm',
         'details_name', 'details_phone', 'details_email', 'final', 'none'];
       const schema = {
         type: 'object', additionalProperties: false,
         properties: {
-          action: { type: 'string', enum: firstContact ? ['SEND'] : ['SEND', 'NEEDS_INPUT', 'CONFIRMED', 'UNAVAILABLE'] },
+          action: { type: 'string', enum: firstContact ? ['SEND'] : financialInput ? ['NEEDS_INPUT'] : ['SEND', 'NEEDS_INPUT', 'CONFIRMED', 'UNAVAILABLE'] },
           messageKey: { type: 'string', enum: keys },
           message: { type: 'string' },
-          field: { type: 'string', enum: firstContact ? ['none'] : ['name', 'phone', 'email', 'restaurant', 'other', 'none'] },
+          field: { type: 'string', enum: firstContact ? ['none'] : financialInput ? ['other'] : ['name', 'phone', 'email', 'restaurant', 'other', 'none', ...(this.alternativeTimes.size ? ['time'] : [])] },
           question: { type: 'string' },
           restaurantName: { type: 'string', ...(firstContact ? { enum: ['', this.booking!.restaurant].filter((v, i, values) => values.indexOf(v) === i) } : {}) },
           restaurantEvidence: { type: 'string' },
@@ -370,7 +440,7 @@ export class BookingAgent {
         catch { throw new Error('AGENT_DECISION'); }
         if (!decision || !['SEND', 'NEEDS_INPUT', 'CONFIRMED', 'UNAVAILABLE'].includes(decision.action) ||
             !keys.includes(decision.messageKey) ||
-            !['name', 'phone', 'email', 'restaurant', 'other', 'none'].includes(decision.field) ||
+            !['name', 'phone', 'email', 'restaurant', 'time', 'other', 'none'].includes(decision.field) ||
             typeof decision.message !== 'string' ||
             decision.message.length > 3000 ||
             (decision.restaurantName !== undefined && typeof decision.restaurantName !== 'string') ||
@@ -378,6 +448,7 @@ export class BookingAgent {
             typeof decision.question !== 'string' || decision.question.length > 500) {
           throw new Error('AGENT_DECISION');
         }
+        decision.message = this.journal.some(e => e.source === 'assistant') ? removeGreeting(decision.message) : decision.message.trim();
         return decision;
       };
       let d = parseDecision((await generate()).text);
@@ -419,13 +490,20 @@ export class BookingAgent {
       if (d.action === 'SEND' && d.messageKey.startsWith('details_') && !this.personal[d.messageKey.slice(8) as 'name' | 'phone' | 'email']) {
         throw new Error('AGENT_UNGROUNDED_DETAILS');
       }
-      if (d.message && !(await this.review(d.message, d.action))) {
-        this.audit.technical('warn', 'agent.reply_rejected', { action: d.action }, this.sessionId);
+      if ((d.action === 'SEND' && !d.message.trim()) ||
+        (financialInput && (!d.message.trim() || d.action !== 'NEEDS_INPUT' || d.field !== 'other')) ||
+        (d.message && !(await this.review(d.message, d.action, managerText)))) {
+        const issue = financialInput ? 'owner_financial_consent_required' : this.replyIssue(d.message, managerText) ?? 'factual_review';
+        this.audit.technical('warn', 'agent.reply_rejected', { action: d.action, reason: issue }, this.sessionId);
         // One repair only; no unbounded regeneration or unsafe delivery.
         d = parseDecision((await generate('The proposed reply failed factual/safety review. ' +
           'Generate a truthful customer-facing English reply only. Do not include internal field names or metadata. ' +
-          'Never assert unknown facts or accept changed terms.')).text);
-        if (!d.message || !(await this.review(d.message, d.action))) throw new Error('AGENT_UNSAFE_REPLY');
+          'Never assert unknown facts or accept changed terms. Rejection: ' + issue + '. ' +
+          'Use only the current booking time in manager-facing text. For an alternative ask the owner with NEEDS_INPUT/time; ' +
+          'list proposed times in question, not message. Use calendar for the weekday or omit the weekday. ' +
+          'If asked whether you are AI, truthfully say you are an AI booking assistant. ' +
+          (financialInput ? 'Return NEEDS_INPUT/other, decline sending card data and check the deposit with the owner. ' : ''))).text);
+        if (!d.message || !(await this.review(d.message, d.action, managerText))) throw new Error('AGENT_UNSAFE_REPLY');
       }
       if (!this.running || version !== this.version || revision !== this.revision) return;
       // Recheck structural constraints after a review repair, too.
@@ -433,11 +511,17 @@ export class BookingAgent {
       if (d.action === 'SEND' && d.messageKey.startsWith('details_') && !this.personal[d.messageKey.slice(8) as 'name' | 'phone' | 'email']) throw new Error('AGENT_UNGROUNDED_DETAILS');
       if (this.ownerInput && ['name', 'phone', 'email', 'restaurant'].includes(this.ownerInput.field) &&
         !d.message.includes(this.ownerInput.value)) throw new Error('AGENT_OWNER_INPUT_NOT_DELIVERED');
+      if (this.ownerInput?.field === 'time' && this.ownerInput.value !== 'decline' &&
+        !bookingTimes(d.message, this.booking!.time).includes(this.ownerInput.value)) {
+        throw new Error('AGENT_OWNER_INPUT_NOT_DELIVERED');
+      }
+      if (financialInput && (d.action !== 'NEEDS_INPUT' || d.field !== 'other')) throw new Error('AGENT_DECISION');
       explanation = this.explain(d);
       this.journal.push({ source: 'system', text: 'Decision: ' + JSON.stringify(d) });
       if (firstContact && d.action !== 'SEND') throw new Error('AGENT_DECISION');
       if (d.action === 'NEEDS_INPUT') {
         if (d.field === 'none') throw new Error('AGENT_DECISION');
+        if (d.field === 'time' && !this.alternativeTimes.size) throw new Error('AGENT_DECISION');
         const repeated = this.waiting === d.field;
         if (d.field === 'other' && /\b(?:deposit|pay|payment|charge|fee|card|credit|allerg\w*|prefer\w*|inside|outside)\b|[£$€]/i.test(managerText)) {
           this.requireOwnerConsent = true;
@@ -448,8 +532,16 @@ export class BookingAgent {
         return;
       }
       if (d.action === 'UNAVAILABLE') {
-        if (d.message) await this.sendChecked(d.message, version, explanation);
-        throw new Error('BOOKING_UNAVAILABLE');
+        const alreadyWaiting = this.state === 'WAITING_AVAILABILITY';
+        if (d.message && !alreadyWaiting) await this.sendChecked(d.message, version, explanation);
+        if (version !== this.version || !this.running) return;
+        this.confirmationReady = false;
+        this.move('WAITING_AVAILABILITY');
+        if (!alreadyWaiting) {
+          this.audit.technical('info', 'booking.awaiting_availability', {}, this.sessionId);
+          this.log('На потрібний час місць немає. Очікую нових повідомлень менеджера; /stop завершує очікування.');
+        }
+        return;
       }
       if (d.action === 'CONFIRMED') {
         if (this.waiting || this.requireOwnerConsent || !explicitYes(managerText) ||
@@ -473,7 +565,9 @@ export class BookingAgent {
       }
       if (!d.message.trim()) throw new Error('AGENT_DECISION');
       this.confirmationReady = false;
-      if (!this.waiting) this.move(d.messageKey === 'confirm' ? 'CONFIRMING' : 'NEGOTIATING');
+      if (!this.waiting && !(this.state === 'WAITING_AVAILABILITY' && d.messageKey === 'reply')) {
+        this.move(d.messageKey === 'confirm' ? 'CONFIRMING' : 'NEGOTIATING');
+      }
       await this.sendChecked(d.message, version, explanation);
       this.ownerInput = undefined;
       if (version === this.version && this.running) {
@@ -513,8 +607,8 @@ export class BookingAgent {
       decision: 'request_owner_input',
     };
     if (d.action === 'UNAVAILABLE') return {
-      understood: 'Менеджер відмовив у бронюванні на задані параметри.',
-      decision: 'booking_unavailable',
+      understood: 'На задані параметри місць немає; очікуємо можливого оновлення від менеджера.',
+      decision: 'wait_for_availability',
     };
     if (d.action === 'CONFIRMED') return {
       understood: 'Менеджер явно підтвердив попереднє повне зведення.',
@@ -533,7 +627,7 @@ export class BookingAgent {
     text: string, version: number, explanation: Omit<Explanation, 'state'>,
   ): Promise<void> {
     if (version !== this.version || !this.running) return;
-    if (this.hasInternalText(text)) throw new Error('AGENT_UNSAFE_REPLY');
+    if (this.replyIssue(text)) throw new Error('AGENT_UNSAFE_REPLY');
     this.ensureFuture();
     const revision = this.revision;
     try { await this.send(text, () => version === this.version && revision === this.revision && this.running); }

@@ -46,7 +46,8 @@ async function harness(t) {
       assert.equal('voiceRequested' in settings.responseJsonSchema.properties, false);
       payloads.push(payload);
       const menu = fixtureMenu(payload);
-      const key = payload.ownerInput ? 'details_' + payload.ownerInput.field : decisions.shift();
+      const key = payload.ownerInput && ['name', 'phone', 'email'].includes(payload.ownerInput.field) ?
+        'details_' + payload.ownerInput.field : decisions.shift();
       assert.ok(key, 'Missing mocked AI decision');
       const decision = typeof key === 'object' ? key : key === 'confirmed' ?
         { action: 'CONFIRMED', messageKey: 'final', message: menu.final, field: 'none', question: '' } : key === 'name' ?
@@ -128,4 +129,39 @@ test('text containing a link preview is processed as text', async t => {
   await h.message('Available; our menu is https://example.com.', preview);
   assert.equal(h.payloads.length, 2);
   assert.match(h.sent.at(-1), /Could you please confirm/);
+});
+
+test('Telegram forwards follow-ups and new availability after restaurant refusal', async t => {
+  const h = await harness(t);
+  h.decisions.push('opening', { action: 'UNAVAILABLE', messageKey: 'reply', field: 'none', question: '',
+    message: 'Thank you for checking. Please let me know if 17:00 becomes available.' },
+    { action: 'SEND', messageKey: 'reply', field: 'none', question: '', message: 'Yes, I am an AI booking assistant.' },
+    'confirm', 'confirmed');
+  h.terminal.emit('line', '/book'); await h.flush();
+  await h.message('17:00 is fully booked.');
+  assert.equal(h.rows.filter(r => r.event === 'booking.finished').length, 0);
+  await h.message('Am I talking to a bot?');
+  assert.match(h.sent.at(-1), /AI booking assistant/);
+  await h.message('A table for two at 17:00 has just freed up.');
+  assert.match(h.sent.at(-1), /Could you please confirm/);
+  await h.message('Yes, confirmed.');
+  assert.match(h.sent.at(-1), /Booking confirmed: Test Bistro/);
+  assert.equal(h.rows.findLast(r => r.event === 'booking.finished').data.outcome, 'COMPLETED');
+  assert.equal(h.rows.filter(r => r.event === 'booking.started').length, 1);
+});
+
+test('console time approval updates the proposal before confirming it in Telegram', async t => {
+  const h = await harness(t);
+  h.decisions.push('opening', { action: 'NEEDS_INPUT', messageKey: 'none', field: 'time',
+    message: 'I will check the timing with the guest.', question: 'Do you approve 17:30?' }, 'confirm', 'confirmed');
+  h.terminal.emit('line', '/book'); await h.flush();
+  await h.message('Only half five is available.');
+  assert.ok(h.sent.every(text => !text.includes('17:30')));
+  h.terminal.emit('line', '/input time 17:30'); await h.flush();
+  assert.match(h.sent.at(-1), /17:30/);
+  assert.equal(h.payloads.at(-1).booking.time, '17:30');
+  assert.equal(h.payloads.at(-1).originalBooking.time, '17:00');
+  await h.message('Yes, confirmed.');
+  assert.equal(h.rows.findLast(r => r.event === 'booking.finished').data.outcome, 'COMPLETED');
+  assert.equal(h.rows.filter(r => r.event === 'agent.time_approved').length, 1);
 });

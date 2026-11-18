@@ -4,6 +4,7 @@ import { BookingAgent } from '../../../dist/modules/agent/agent.js';
 import { londonClock, loadBooking } from '../../../dist/modules/agent/config.js';
 import { Logger } from '../../../dist/modules/logger/logger.js';
 import { fixtureMenu } from './fixtures.mjs';
+import { bookingTimes, bookingCalendar } from '../../../dist/modules/agent/reply-policy.js';
 
 let saved;
 beforeEach(() => {
@@ -35,7 +36,7 @@ function setup(decisions, options = {}) {
         return { text: JSON.stringify({ ...send('details_' + payload.ownerInput.field),
           message: payload.menu['details_' + payload.ownerInput.field] }), content: {} };
       }
-      if (payload.waiting && payload.waiting !== 'other') {
+      if (payload.waiting && payload.waiting !== 'other' && payload.waiting !== 'time') {
         return { text: JSON.stringify({ ...send('reply'), message: payload.menu.reply }), content: {} };
       }
       calls.push(payload);
@@ -91,7 +92,7 @@ test('manager follow-up can resolve ambiguity without owner input or changing bo
 });
 
 test('manager follow-up cannot bypass owner consent to a deposit while paused', async () => {
-  const s = setup([send('opening'), send('confirm'), need('other'), confirmed]);
+  const s = setup([send('opening'), send('confirm'), { ...need('other'), message: 'I will check the deposit with the guest.' }, confirmed]);
   await s.agent.start();
   await s.receive('Available');
   await s.receive('A deposit is required.');
@@ -99,7 +100,7 @@ test('manager follow-up cannot bypass owner consent to a deposit while paused', 
   assert.equal(s.status().state, 'NEEDS_INPUT');
   assert.equal(s.status().needsInput, 'other');
   assert.equal(s.status().managerConfirmed, false);
-  assert.equal(s.outgoing.length, 2);
+  assert.equal(s.outgoing.length, 3);
 });
 
 test('IDLE does not invoke Gemini or send', () => {
@@ -385,11 +386,11 @@ test('stop prevents retrying a failed AI call in the stopped booking', async () 
   assert.equal(s.outgoing.length, 0);
 });
 
-test('definitive manager refusal enters FAILED', async () => {
+test('manager refusal waits for an update instead of entering FAILED', async () => {
   const s = setup([send('opening'), { action: 'UNAVAILABLE', messageKey: 'none', field: 'none', question: '' }]);
   await s.agent.start();
   await s.receive('We have no tables at 17:00 today.');
-  assert.equal(s.status().state, 'FAILED');
+  assert.equal(s.status().state, 'WAITING_AVAILABILITY');
   assert.equal(s.outgoing.length, 1);
 });
 
@@ -525,7 +526,8 @@ test('uncertain availability cannot complete the booking', async () => {
 
 test('conflicting confirmation cannot complete even if both AI decisions claim it is confirmed', async () => {
   for (const text of ['I have booked your table at 18:00.', 'I have booked a table for three.',
-    'Your reservation is confirmed for 2026-11-18.', 'Your table is booked at 6 pm.']) {
+    'Your reservation is confirmed for 2026-11-18.', 'Your table is booked at 6 pm.',
+    'Your table is booked at half five.', 'Your table is booked at five thirty.']) {
     const s = setup([send('opening'), send('confirm'), confirmed, confirmed]);
     await s.agent.start();
     await s.receive('Available');
@@ -577,11 +579,236 @@ test('repeated internal metadata is never delivered after a repair', async () =>
   assert.equal(s.outgoing.length, 0);
 });
 
-test('polite refusal is sent before closing an unavailable booking', async () => {
+test('polite acknowledgement is sent before waiting for availability', async () => {
   const s = setup([send('opening'), { action: 'UNAVAILABLE', messageKey: 'reply', field: 'none',
     message: 'Thank you for checking. Have a lovely afternoon.', question: '' }]);
   await s.agent.start();
   await s.receive('We are fully booked today.');
-  assert.equal(s.status().state, 'FAILED');
+  assert.equal(s.status().state, 'WAITING_AVAILABILITY');
   assert.match(s.outgoing.at(-1), /Thank you for checking/);
+});
+
+test('refusal stays open for questions and a newly available original table in the same session', async () => {
+  const rows = [];
+  const audit = new Logger({ files: false, color: false, output: line => rows.push(JSON.parse(line)) });
+  const unavailable = { action: 'UNAVAILABLE', messageKey: 'reply', field: 'none', question: '',
+    message: 'Thank you for checking. Please let me know if a table at 17:00 becomes available.' };
+  const s = setup([send('opening'), unavailable,
+    { ...send('reply'), message: 'Yes, I am an AI booking assistant arranging this reservation for the guest.' },
+    { ...send('reply'), message: 'You have not told me your name yet.' }, send('confirm'), confirmed], { audit });
+  await s.agent.start();
+  const id = s.agent.sessionId;
+  await s.receive('No tables at 17:00; 17:30 is the earliest.');
+  assert.equal(s.status().state, 'WAITING_AVAILABILITY');
+  assert.equal(s.agent.running, true);
+  await s.receive('Am I chatting to a person or a bot?');
+  assert.match(s.outgoing.at(-1), /AI booking assistant/);
+  assert.equal(s.status().state, 'WAITING_AVAILABILITY');
+  await s.receive('What is my name?');
+  assert.match(s.outgoing.at(-1), /not told me your name/);
+  await s.receive('Good news — a 5 o’clock table has just freed up for two at 17:00 today. Reference OR-1117.');
+  assert.equal(s.status().state, 'CONFIRMING');
+  assert.equal(s.agent.sessionId, id);
+  assert.ok(s.calls.at(-1).transcript.some(e => e.text.includes('17:30 is the earliest')));
+  assert.ok(s.calls.at(-1).transcript.some(e => e.text.includes('person or a bot')));
+  await s.receive('Yes, confirmed.');
+  assert.equal(s.status().state, 'COMPLETED');
+  assert.match(s.outgoing.at(-1), /Test Bistro, London, 2026-11-17, 17:00.*2 guests/);
+  const sent = s.outgoing.length;
+  await s.receive('Thank you.');
+  assert.equal(s.outgoing.length, sent);
+  assert.equal(rows.filter(r => r.event === 'booking.started').length, 1);
+  assert.equal(rows.filter(r => r.event === 'booking.finished').length, 1);
+  assert.equal(rows.find(r => r.event === 'booking.finished').data.outcome, 'COMPLETED');
+  assert.ok(rows.some(r => r.event === 'conversation.message' && r.state === 'WAITING_AVAILABILITY'));
+});
+
+test('repeated unavailability does not repeat closing messages or trigger autonomous polling', async () => {
+  const unavailable = { action: 'UNAVAILABLE', messageKey: 'reply', field: 'none', question: '', message: 'Thank you for checking.' };
+  const s = setup([send('opening'), unavailable, unavailable]);
+  await s.agent.start();
+  await s.receive('We are full.');
+  await s.receive('Sorry, we are still full.');
+  assert.equal(s.status().state, 'WAITING_AVAILABILITY');
+  assert.equal(s.calls.length, 3);
+  assert.equal(s.outgoing.length, 2);
+});
+
+test('stop while waiting prevents reactivation on later manager availability', async () => {
+  const s = setup([send('opening'), { action: 'UNAVAILABLE', messageKey: 'none', field: 'none', question: '' }]);
+  await s.agent.start();
+  await s.receive('We have no tables.');
+  s.agent.cancel();
+  await s.receive('A table has just become available.');
+  assert.equal(s.status().state, 'CANCELLED');
+  assert.equal(s.calls.length, 2);
+  assert.equal(s.outgoing.length, 1);
+});
+
+test('a table offered after the requested slot has passed cannot be booked', async () => {
+  let now = new Date('2026-11-17T12:00:00Z');
+  const s = setup([send('opening'), { action: 'UNAVAILABLE', messageKey: 'none', field: 'none', question: '' }], { now: () => now });
+  await s.agent.start();
+  await s.receive('No tables at 17:00.');
+  now = new Date('2026-11-17T17:01:00Z');
+  await s.receive('A table at 17:00 has become available.');
+  assert.equal(s.status().state, 'FAILED');
+  assert.equal(s.status().lastError, 'BOOKING_PAST');
+  assert.equal(s.outgoing.length, 1);
+});
+
+test('restaurant time parser understands numeric and British alternatives without treating guests as hours', () => {
+  assert.deepEqual(bookingTimes('Half five or six, please.', '17:00'), ['17:30', '18:00']);
+  assert.deepEqual(bookingTimes('5:30 pm or 18:00', '17:00'), ['17:30', '18:00']);
+  assert.deepEqual(bookingTimes('quarter to six or quarter past five', '17:00'), ['17:45', '17:15']);
+  assert.deepEqual(bookingTimes('five thirty', '17:00'), ['17:30']);
+  assert.deepEqual(bookingTimes('A table for two on 18 November 2026. Deposit £20 per person.', '17:00'), []);
+  assert.deepEqual(bookingTimes('At 5:00 am, not at 5 pm.', '17:00'), ['05:00', '17:00']);
+});
+
+test('unapproved alternative in generated text is blocked even when the AI reviewer approves it', async () => {
+  process.env.BOOKING_NAME = 'Synthetic Guest';
+  const s = setup([send('opening'), { ...send('details_name'),
+    message: 'The name is Synthetic Guest. Could we please go for the 5:30 pm slot?' },
+    { ...need('time'), message: 'I will check the timing with the guest.', question: 'Do you approve 17:30 or 18:00?' },
+    { ...send('reply'), message: 'I am still checking the timing with the guest.' }, send('confirm'), confirmed],
+    { review: () => true });
+  await s.agent.start();
+  await s.receive('5 is fully booked, but I could do half five or six. What name, please?');
+  assert.equal(s.status().needsInput, 'time');
+  assert.equal(s.status().booking.time, '17:00');
+  assert.deepEqual(s.status().alternativeTimes, ['17:30', '18:00']);
+  assert.ok(s.outgoing.every(m => !/5:30|17:30|half five/i.test(m)));
+  await s.agent.input('time', '18:30');
+  assert.equal(s.status().needsInput, 'time');
+  await s.agent.input('other', '17:30 works for me');
+  assert.equal(s.status().booking.time, '17:00');
+  await s.receive('Either works. Yes, confirmed for half five.');
+  assert.equal(s.status().needsInput, 'time');
+  assert.equal(s.status().booking.time, '17:00');
+  await s.agent.input('time', '17:30');
+  assert.equal(s.status().booking.time, '17:30');
+  assert.equal(s.status().state, 'CONFIRMING');
+  assert.equal(s.calls.at(-1).originalBooking.time, '17:00');
+  assert.match(s.outgoing.at(-1), /17:30/);
+  await s.receive('Yes, confirmed.');
+  assert.equal(s.status().state, 'COMPLETED');
+  assert.match(s.outgoing.at(-1), /17:30/);
+});
+
+test('an owner supplying only a name cannot approve a manager alternative', async () => {
+  const s = setup([send('opening'), need('name')]);
+  await s.agent.start();
+  await s.receive('Only half five is available. What is your name?');
+  await s.agent.input('name', 'Synthetic Guest');
+  assert.equal(s.status().booking.time, '17:00');
+  assert.deepEqual(s.status().alternativeTimes, ['17:30']);
+  assert.match(s.outgoing.at(-1), /Synthetic Guest/);
+  assert.ok(!s.outgoing.at(-1).includes('17:30'));
+});
+
+test('ambiguous acceptance of a later slot is blocked even without a time in the outgoing message', async () => {
+  for (const message of ['Later works for us. Please book it.', 'We will take the later slot.',
+    'Either would be lovely.', 'That works, thank you.']) {
+    const s = setup([send('opening'), { ...send('reply'), message },
+      { ...need('time'), message: 'I will check the timing with the guest.' }], { review: () => true });
+    await s.agent.start();
+    await s.receive('Only half five or six is available.');
+    assert.equal(s.status().needsInput, 'time');
+    assert.equal(s.status().booking.time, '17:00');
+    assert.ok(!s.outgoing.includes(message));
+  }
+});
+
+test('owner can decline alternatives without changing the original time or stopping the listener', async () => {
+  const s = setup([send('opening'), { ...need('time'), message: 'I will check the timing with the guest.' },
+    { action: 'UNAVAILABLE', messageKey: 'reply', field: 'none', question: '',
+      message: 'Thank you for checking. We need 17:00; please let us know if a table becomes available.' }]);
+  await s.agent.start();
+  await s.receive('Only half five is available.');
+  await s.agent.input('time', 'no');
+  assert.equal(s.status().booking.time, '17:00');
+  assert.equal(s.status().state, 'WAITING_AVAILABILITY');
+  assert.equal(s.calls.at(-1).ownerInput.value, 'decline');
+  assert.ok(s.outgoing.every(text => !/17:30|5:30/.test(text)));
+});
+
+test('greeting appears only on the first outgoing message', async () => {
+  const s = setup([send('opening'), { ...send('reply'), message: 'Hello, thank you for checking.' },
+    { ...send('reply'), message: 'Good afternoon! Hello, could you confirm availability, please?' }]);
+  await s.agent.start();
+  await s.receive('I will check.');
+  await s.receive('One moment.');
+  assert.match(s.outgoing[0], /^Good afternoon/);
+  assert.equal(s.outgoing[1], 'Thank you for checking.');
+  assert.equal(s.outgoing[2], 'Could you confirm availability, please?');
+});
+
+test('weekday comes from the actual London booking date and an incorrect weekday is repaired', async () => {
+  assert.equal(bookingCalendar('2026-11-18').weekday, 'Wednesday');
+  const londonDate = loadBooking(new Date('2026-07-01T23:30:00Z')).date;
+  assert.equal(londonDate, '2026-07-02');
+  assert.equal(bookingCalendar(londonDate).weekday, 'Thursday');
+  const s = setup([{ ...send('opening'), message: 'Hello, a table for two on Tuesday 18 November 2026 at 17:00, please.' },
+    { ...send('opening'), message: 'Hello, a table for two on Wednesday 18 November 2026 at 17:00, please.' }],
+    { now: () => new Date('2026-11-18T12:00:00Z'), review: () => true });
+  await s.agent.start();
+  assert.equal(s.outgoing.length, 1);
+  assert.match(s.outgoing[0], /Wednesday/);
+  assert.ok(!s.outgoing[0].includes('Tuesday'));
+  assert.equal(s.calls[0].calendar.weekday, 'Wednesday');
+});
+
+test('a generated claim to be human is rejected and replaced with truthful AI disclosure', async () => {
+  const s = setup([send('opening'), { ...send('reply'), message: 'I am a human, not a bot.' },
+    { ...send('reply'), message: 'Yes, I am an AI booking assistant arranging this on behalf of the guest.' }], { review: () => true });
+  await s.agent.start();
+  await s.receive('Out of curiosity, am I chatting to a person or a bot?');
+  assert.equal(s.outgoing.length, 2);
+  assert.match(s.outgoing.at(-1), /AI booking assistant/);
+  assert.ok(s.outgoing.every(m => !m.includes('I am a human')));
+});
+
+test('deposit and card request pauses for the owner, rejects card input and prevents premature completion', async () => {
+  const s = setup([send('opening'), { ...send('reply'), message: 'The deposit is fine. We will pay it.' },
+    { ...need('other'), message: 'I cannot share card details here. I will check the deposit with the guest; could you send a secure payment link?' }, confirmed],
+    { review: () => true });
+  await s.agent.start();
+  await s.receive('Before I finalise: we take a £20 per person deposit. Could you send me the card number and expiry date?');
+  assert.equal(s.status().needsInput, 'other');
+  assert.ok(s.outgoing.every(m => !m.includes('We will pay')));
+  const calls = s.calls.length;
+  for (const value of ['4111 1111 1111 1111 expiry 12/28', '12/28', '123']) {
+    await s.agent.input('other', value);
+  }
+  assert.equal(s.calls.length, calls);
+  assert.ok(!JSON.stringify(s.agent.context()).includes('4111'));
+  assert.ok(!JSON.stringify(s.agent.context()).includes('12/28'));
+  await s.receive('Your booking is confirmed.');
+  assert.equal(s.status().state, 'NEEDS_INPUT');
+  assert.equal(s.status().managerConfirmed, false);
+});
+
+test('approving a different deposit amount does not authorise the requested deposit', async () => {
+  const s = setup([send('opening'), { ...need('other'), message: 'I will check the deposit with the guest.' },
+    { ...send('reply'), message: 'Could you clarify the deposit amount, please?' }, confirmed]);
+  await s.agent.start();
+  await s.receive('A £20 per person deposit is required.');
+  await s.agent.input('other', 'I approve a £10 deposit.');
+  assert.equal(s.calls.at(-1).depositApproved, false);
+  await s.receive('Your reservation is confirmed.');
+  assert.equal(s.status().state, 'NEEDS_INPUT');
+  assert.equal(s.status().managerConfirmed, false);
+});
+
+test('an explicit owner deposit approval can request a secure link without sending card data or claiming payment', async () => {
+  const s = setup([send('opening'), { ...need('other'), message: 'I cannot share card details here. I will check with the guest.' },
+    { ...send('reply'), message: 'Could you please send a secure payment link for the deposit?' }]);
+  await s.agent.start();
+  await s.receive('We need a £20 per person deposit. Please send the card number and expiry date.');
+  await s.agent.input('other', 'I approve the £20 per person deposit. Please ask for a secure payment link.');
+  assert.equal(s.calls.at(-1).depositApproved, true);
+  assert.equal(s.status().managerConfirmed, false);
+  assert.match(s.outgoing.at(-1), /secure payment link/);
+  assert.ok(s.outgoing.every(m => !/4111|has been paid|we have paid/i.test(m)));
 });

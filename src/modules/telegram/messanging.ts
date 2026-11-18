@@ -183,9 +183,9 @@ export async function runMessaging(
       return;
     }
     if (command.startsWith('/input ')) {
-      const match = /^\/input\s+(restaurant|name|phone|email|other)\s+(.+)$/.exec(command);
+      const match = /^\/input\s+(restaurant|name|phone|email|time|other)\s+(.+)$/.exec(command);
       if (!match) {
-        audit.notice('Формат: /input restaurant|name|phone|email|other значення');
+        audit.notice('Формат: /input restaurant|name|phone|email|time|other значення');
         return;
       }
       const field = match[1]!;

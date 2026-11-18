@@ -98,7 +98,7 @@ export class Logger {
           this.redactor.conversation(message.text, message.trustedText === true),
         understood: this.redactor.text(explanation.understood),
         decision: this.redactor.text(explanation.decision),
-        state: ['IDLE', 'NEGOTIATING', 'NEEDS_INPUT', 'CONFIRMING', 'COMPLETED', 'FAILED', 'CANCELLED'].includes(explanation.state)
+        state: ['IDLE', 'NEGOTIATING', 'NEEDS_INPUT', 'CONFIRMING', 'WAITING_AVAILABILITY', 'COMPLETED', 'FAILED', 'CANCELLED'].includes(explanation.state)
           ? explanation.state : 'UNKNOWN',
       }, timestamp, message.direction);
     };
